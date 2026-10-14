@@ -13,6 +13,7 @@ import io.github.erenche.syncclipboard.bridge.SyncClipboardBridge
 import io.github.erenche.syncclipboard.common.PackageNames
 import io.github.erenche.syncclipboard.common.util.Logger
 import io.github.libxposed.api.XposedInterface
+import java.io.File
 import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
 
@@ -24,6 +25,10 @@ object SystemLocalNetworkHooker {
     private const val TAG = "LocalNetHook"
     private const val BPF_CLASS = "com.android.server.BpfNetMaps"
     private const val MONITOR_CLASS = "com.android.server.connectivity.PermissionMonitor"
+    // Connectivity 模块经 jarjar 打包，部分 ROM 上内部类名带此前缀。
+    private const val JARJAR_PREFIX = "android.net.connectivity."
+    // system_server 的系统 Context 没有数据目录，不能用 SharedPreferences。
+    private val settingFile = File("/data/system/syncclipboard_local_network")
 
     private val handles = mutableListOf<XposedInterface.HookHandle>()
     private val hookedClasses = HashSet<Class<*>>()
@@ -102,8 +107,14 @@ object SystemLocalNetworkHooker {
     @Synchronized
     private fun installNetworkHooks(loader: ClassLoader?) {
         if (!running || loader == null) return
+        val bpfClass = findClass(BPF_CLASS, loader) ?: return
+        hookBpfClass(bpfClass, loader)
+    }
+
+    @Synchronized
+    private fun hookBpfClass(bpfClass: Class<*>, loader: ClassLoader?) {
+        if (!running) return
         val xposed = module ?: return
-        val bpfClass = runCatching { Class.forName(BPF_CLASS, false, loader) }.getOrNull() ?: return
         if (!hookedClasses.add(bpfClass)) return
         val available = writers(bpfClass)
         available.forEach { writer ->
@@ -130,7 +141,7 @@ object SystemLocalNetworkHooker {
                 }
             }
         }
-        runCatching { Class.forName(MONITOR_CLASS, false, loader) }.getOrNull()?.declaredConstructors?.forEach { constructor ->
+        findClass(MONITOR_CLASS, loader ?: bpfClass.classLoader)?.declaredConstructors?.forEach { constructor ->
             runCatching {
                 handles += xposed.hook(constructor).intercept { chain ->
                     val result = chain.proceed()
@@ -147,7 +158,7 @@ object SystemLocalNetworkHooker {
         val trafficBit = constant(loader, "TRAFFIC_PERMISSION_ACCESS_LOCAL_NETWORK", "PERMISSION_ACCESS_LOCAL_NETWORK")
         val internetBit = constant(loader, "TRAFFIC_PERMISSION_INTERNET", "PERMISSION_INTERNET") ?: 0
         val chunkBit = runCatching {
-            Class.forName("com.android.net.module.util.bpf.UidPermissionChunk", false, loader)
+            findClass("com.android.net.module.util.bpf.UidPermissionChunk", loader)!!
                 .getField("PERMISSION_BIT_ACCESS_LOCAL_NETWORK").getInt(null)
         }.getOrNull()
         return clazz.declaredMethods.mapNotNull { method ->
@@ -165,7 +176,7 @@ object SystemLocalNetworkHooker {
 
     private fun constant(loader: ClassLoader?, vararg names: String): Int? {
         for (className in arrayOf("com.android.server.connectivity.NetworkPermissions", "android.net.INetd")) {
-            val clazz = runCatching { Class.forName(className, false, loader) }.getOrNull() ?: continue
+            val clazz = findClass(className, loader) ?: continue
             for (name in names) {
                 runCatching { clazz.getDeclaredField(name).apply { isAccessible = true }.getInt(null) }.getOrNull()?.let { return it }
             }
@@ -224,15 +235,14 @@ object SystemLocalNetworkHooker {
             systemUiUid = runCatching { candidate.packageManager.getApplicationInfo(PackageNames.SYSTEM_UI, 0).uid }.getOrDefault(-1)
         }
         if (receiver != null || systemUiUid < 0) return
+        enabled = runCatching { settingFile.readText().trim() != "0" }.getOrDefault(true)
         runCatching {
-            enabled = candidate.getSharedPreferences(LocalNetworkAccessBridge.PREFS_NAME, Context.MODE_PRIVATE)
-                .getBoolean(LocalNetworkAccessBridge.PREF_ENABLED, true)
             val r = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context, intent: Intent) {
                     if (intent.action != LocalNetworkAccessBridge.ACTION || !intent.hasExtra(LocalNetworkAccessBridge.EXTRA_ENABLED)) return
                     enabled = intent.getBooleanExtra(LocalNetworkAccessBridge.EXTRA_ENABLED, true)
-                    candidate.getSharedPreferences(LocalNetworkAccessBridge.PREFS_NAME, Context.MODE_PRIVATE).edit()
-                        .putBoolean(LocalNetworkAccessBridge.PREF_ENABLED, enabled).apply()
+                    runCatching { settingFile.writeText(if (enabled) "1" else "0") }
+                        .onFailure { Logger.warn(TAG, "Cannot persist LAN setting: ${it.message}") }
                     Logger.info(TAG, "SystemUI uid=$systemUiUid LAN override enabled=$enabled")
                     loggedGrant = false
                     scheduleRefresh()
@@ -279,7 +289,8 @@ object SystemLocalNetworkHooker {
                 .apply { isAccessible = true }.invoke(instance, target) as Int
         }
         val map = field(instance, "sUidPermissionMap") ?: error("UID permission map unavailable")
-        val keyClass = Class.forName("com.android.net.module.util.Struct\$S32", false, instance.javaClass.classLoader)
+        val keyClass = findClass("com.android.net.module.util.Struct\$S32", instance.javaClass.classLoader)
+            ?: error("Struct.S32 unavailable")
         val key = keyClass.getConstructor(Int::class.javaPrimitiveType).newInstance(target)
         val getter = map.javaClass.methods.first { it.name == "getValue" && it.parameterCount == 1 }
         val value = getter.invoke(map, key) ?: return writer.internetBit // 流量表无条目时默认具有 INTERNET 权限。
@@ -325,6 +336,11 @@ object SystemLocalNetworkHooker {
                     val live = field(service, "mBpfNetMaps")
                     if (live != null) {
                         backend = live
+                        // 按实例的真实类挂钩，不依赖类名（jarjar 可能改名）。
+                        Logger.info(TAG, "Connectivity BPF backend: ${live.javaClass.name}")
+                        hookBpfClass(live.javaClass, live.javaClass.classLoader)
+                        // 开机时可能错过框架写入，借 ConnectivityService 的线程补写。
+                        if (writeHandler == null) writeHandler = field(service, "mHandler") as? Handler ?: callbacks
                         // 根据运行时开关选择实际使用的权限表。
                         val chunk = runCatching { live.javaClass.getMethod("isUidMigrationEnabled").invoke(live) as Boolean }.getOrNull()
                         val available = writers(live.javaClass)
@@ -339,6 +355,13 @@ object SystemLocalNetworkHooker {
             if (backend == null && attempt < 5) discoverLiveService(attempt + 1)
             else if (backend == null) Logger.warn(TAG, "Connectivity BPF backend not found; reboot and check system_server scope")
         }, if (attempt == 0) 1_000L else 5_000L)
+    }
+
+    private fun findClass(name: String, loader: ClassLoader?): Class<*>? {
+        for (candidate in arrayOf(name, JARJAR_PREFIX + name)) {
+            runCatching { Class.forName(candidate, false, loader) }.getOrNull()?.let { return it }
+        }
+        return null
     }
 
     private fun field(instance: Any, name: String): Any? {

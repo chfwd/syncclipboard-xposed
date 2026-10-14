@@ -10,8 +10,6 @@ import io.github.erenche.syncclipboard.common.util.Logger
 object LocalNetworkAccessBridge {
     const val ACTION = "io.github.erenche.syncclipboard.SET_SYSTEMUI_LOCAL_NETWORK_ACCESS"
     const val EXTRA_ENABLED = "enabled"
-    const val PREFS_NAME = "syncclipboard_local_network"
-    const val PREF_ENABLED = "enabled"
 
     fun send(context: Context, enabled: Boolean) {
         if (Build.VERSION.SDK_INT < 37) return
