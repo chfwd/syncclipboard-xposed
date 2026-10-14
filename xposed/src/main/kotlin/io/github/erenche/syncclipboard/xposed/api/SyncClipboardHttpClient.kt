@@ -38,6 +38,7 @@ import io.ktor.utils.io.readAvailable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import java.io.File
+import kotlinx.coroutines.cancel
 
 /**
  * SyncClipboard 服务器 HTTP 客户端。
@@ -48,7 +49,8 @@ import java.io.File
 class SyncClipboardHttpClient(
     private val baseUrl: String,
     private val username: String? = null,
-    private val password: String? = null
+    private val password: String? = null,
+    httpClient: HttpClient? = null
 ) : SyncClipboardApi {
 
     companion object {
@@ -58,7 +60,7 @@ class SyncClipboardHttpClient(
         private const val HISTORY_API = "/api/history"
     }
 
-    private val client = HttpClient(OkHttp) {
+    private val client = httpClient ?: HttpClient(OkHttp) {
         install(ContentNegotiation) {
             json(Json {
                 ignoreUnknownKeys = true
@@ -208,7 +210,13 @@ class SyncClipboardHttpClient(
             runCatching { response.bodyAsText() }
             throw IllegalStateException("Server returned ${response.status.value}")
         }
+        response.body<ProfileDto>()
         Logger.info(TAG, "Connection test successful")
+    }
+
+    override fun close() {
+        client.coroutineContext.cancel()
+        client.close()
     }
 
     override suspend fun queryHistoryRecords(page: Int, modifiedAfter: String?, types: Int): List<HistoryRecordDto> {

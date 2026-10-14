@@ -9,6 +9,7 @@ import io.github.erenche.syncclipboard.common.model.ProfileDto
 import io.github.erenche.syncclipboard.common.util.HashUtils
 import io.github.erenche.syncclipboard.common.util.Logger
 import io.ktor.client.HttpClient
+import kotlinx.coroutines.cancel
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.logging.LogLevel
 import io.ktor.client.plugins.logging.Logging
@@ -75,6 +76,11 @@ class S3Client(
     }
 
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
+
+    override fun close() {
+        client.coroutineContext.cancel()
+        client.close()
+    }
 
     // ─── SigV4 签名工具 ──────────────────────────────────────
 

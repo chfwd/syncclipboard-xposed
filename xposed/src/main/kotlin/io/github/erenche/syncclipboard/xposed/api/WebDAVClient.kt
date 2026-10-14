@@ -1,6 +1,6 @@
 package io.github.erenche.syncclipboard.xposed.api
 
-import android.util.Base64
+import java.util.Base64
 import io.github.erenche.syncclipboard.common.model.ClipboardContent
 import io.github.erenche.syncclipboard.common.model.ClipboardContentType
 import io.github.erenche.syncclipboard.common.model.HistoryRecordDto
@@ -19,7 +19,14 @@ import io.ktor.client.request.header
 import io.ktor.client.request.put
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
-import io.ktor.client.call.body
+import io.ktor.client.request.prepareGet
+import io.ktor.client.statement.bodyAsChannel
+import io.ktor.http.contentLength
+import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -42,7 +49,8 @@ import java.net.URLEncoder
 class WebDAVClient(
     private val baseUrl: String,
     private val username: String,
-    private val password: String
+    private val password: String,
+    httpClient: HttpClient? = null
 ) : SyncClipboardApi {
 
     companion object {
@@ -51,7 +59,7 @@ class WebDAVClient(
         private const val DATA_DIR = "file"
     }
 
-    private val client = HttpClient(OkHttp) {
+    private val client = httpClient ?: HttpClient(OkHttp) {
         install(ContentNegotiation) {
             json(Json {
                 ignoreUnknownKeys = true
@@ -65,9 +73,7 @@ class WebDAVClient(
 
     private fun buildAuthHeader(): String {
         val credentials = "$username:$password"
-        return "Basic " + Base64.encodeToString(
-            credentials.toByteArray(Charsets.UTF_8), Base64.NO_WRAP
-        )
+        return "Basic " + Base64.getEncoder().encodeToString(credentials.toByteArray(Charsets.UTF_8))
     }
 
     override suspend fun getClipboard(): ProfileDto? {
@@ -86,6 +92,8 @@ class WebDAVClient(
             }
             val responseText = response.bodyAsText()
             Json.decodeFromString<ProfileDto>(responseText)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Logger.warn(TAG, "Failed to get clipboard from WebDAV", e)
             null
@@ -109,18 +117,40 @@ class WebDAVClient(
         destinationPath: String,
         onProgress: ((Float) -> Unit)?
     ): String {
-        val destFile = File(destinationPath)
-        destFile.parentFile?.mkdirs()
-
         // URLEncoder 将空格编码为 +，WebDAV 路径需要 %20（与 C# Uri.EscapeDataString 一致）
         val encodedName = URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
-        val bytes = client.get("$baseUrl/$DATA_DIR/$encodedName") {
+        val result = client.prepareGet("$baseUrl/$DATA_DIR/$encodedName") {
             header(HttpHeaders.Authorization, buildAuthHeader())
-        }.body<ByteArray>()
-
-        destFile.writeBytes(bytes)
+            header(HttpHeaders.AcceptEncoding, "identity")
+        }.execute { response ->
+            check(response.status.isSuccess()) { "WebDAV download failed: HTTP ${response.status.value}" }
+            val expected = response.contentLength()
+            val channel = response.bodyAsChannel()
+            try {
+                downloadToFile(destinationPath) { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    var received = 0L
+                    onProgress?.invoke(0f)
+                    while (true) {
+                        coroutineContext.ensureActive()
+                        val count = channel.readAvailable(buffer)
+                        if (count == -1) break
+                        output.write(buffer, 0, count)
+                        received += count
+                        if (expected != null && expected > 0) {
+                            check(received <= expected) { "WebDAV download exceeds Content-Length" }
+                            onProgress?.invoke((received.toFloat() / expected).coerceIn(0f, 1f))
+                        }
+                    }
+                    check(expected == null || received == expected) { "Incomplete WebDAV download" }
+                }
+            } finally {
+                channel.cancel(null)
+            }
+        }
+        onProgress?.invoke(1f)
         Logger.info(TAG, "File downloaded: $fileName -> $destinationPath")
-        return destinationPath
+        return result
     }
 
     override suspend fun putFile(fileName: String, filePath: String, onProgress: ((Long, Long) -> Unit)?) {
@@ -160,6 +190,8 @@ class WebDAVClient(
                 Logger.info(TAG, "Data directory created: $DATA_DIR/")
             }
             // 405 = 目录已存在，正常情况
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Logger.warn(TAG, "ensureDataDirectoryExists: ${e.message}")
         }
@@ -187,16 +219,21 @@ class WebDAVClient(
     }
 
     override suspend fun testConnection() {
-        // 使用 PROPFIND + Depth: 1 测试连接，与服务端 WebDav.Test() 一致
+        // 只读检查根目录，验证认证和 WebDAV 协议，不修改远端数据。
         val response = client.request(baseUrl) {
             method = HttpMethod.parse("PROPFIND")
             header(HttpHeaders.Authorization, buildAuthHeader())
-            header("Depth", "1")
+            header("Depth", "0")
         }
-        if (!response.status.isSuccess()) {
+        if (response.status.value != 207) {
             throw IllegalStateException("WebDAV test connection failed: ${response.status.value}")
         }
         Logger.info(TAG, "Connection test successful")
+    }
+
+    override fun close() {
+        client.coroutineContext.cancel()
+        client.close()
     }
 
     // WebDAV 不支持原项目的 /api/history API

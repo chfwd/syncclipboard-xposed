@@ -71,6 +71,10 @@
     <string name="server_delete">删除服务器</string>
     <string name="server_delete_confirm">确定要删除服务器 \"%s\" 吗？</string>
     <string name="server_test_success">连接成功</string>
+    <string name="server_test_protocol_success">认证与协议检查通过（只读）</string>
+    <string name="server_test_timeout">连接测试超时</string>
+    <string name="server_test_engine_unavailable">未响应，请检查模块作用域并重启 SystemUI</string>
+    <string name="server_test_process_results">App：%1$s\nSystemUI：%2$s</string>
     <string name="server_updated">服务器已更新</string>
     <string name="server_added">服务器已添加</string>
     <string name="server_test_fail">连接失败</string>

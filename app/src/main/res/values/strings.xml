@@ -71,6 +71,10 @@
     <string name="server_delete">Delete Server</string>
     <string name="server_delete_confirm">Delete server \"%s\"?</string>
     <string name="server_test_success">Connection successful</string>
+    <string name="server_test_protocol_success">Authentication and protocol checks passed (read-only)</string>
+    <string name="server_test_timeout">Connection test timed out</string>
+    <string name="server_test_engine_unavailable">No response; check module scopes and restart SystemUI</string>
+    <string name="server_test_process_results">App: %1$s\nSystemUI: %2$s</string>
     <string name="server_updated">Server updated</string>
     <string name="server_added">Server added</string>
     <string name="server_test_fail">Connection failed</string>

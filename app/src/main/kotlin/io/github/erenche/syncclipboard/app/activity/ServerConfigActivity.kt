@@ -39,6 +39,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.Json
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import io.github.erenche.syncclipboard.xposed.api.ClientFactory
 
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -614,13 +618,14 @@ private fun ServerEditPage(
                         isTesting = true
                         scope.launch {
                             try {
-                                val success = performTestConnection(buildServerConfig())
+                                val result = performTestConnection(context, buildServerConfig())
                                 Toast.makeText(
                                     context,
-                                    if (success) context.getString(R.string.server_test_success)
-                                    else context.getString(R.string.server_test_fail),
-                                    Toast.LENGTH_SHORT
+                                    result,
+                                    Toast.LENGTH_LONG
                                 ).show()
+                            } catch (e: CancellationException) {
+                                throw e
                             } catch (e: Exception) {
                                 Toast.makeText(
                                     context,
@@ -795,43 +800,31 @@ private fun SectionTitle(text: String) {
     }
 }
 
-/**
- * 直接 HTTP 测试服务器连接 — 绕过 Bridge IPC 避免跨进程广播被系统屏蔽。
- */
-private suspend fun performTestConnection(config: ServerConfig): Boolean = withContext(Dispatchers.IO) {
-    try {
-        val urlStr = buildTestUrl(config)
-        val url = java.net.URL(urlStr)
-        val conn = url.openConnection() as java.net.HttpURLConnection
-        conn.connectTimeout = 8000
-        conn.readTimeout = 8000
-        conn.requestMethod = "GET"
-        conn.instanceFollowRedirects = true
-
-        if (!config.username.isNullOrBlank() && !config.password.isNullOrBlank()) {
-            val credentials = "${config.username}:${config.password}"
-            val encoded = android.util.Base64.encodeToString(
-                credentials.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
-            )
-            conn.setRequestProperty("Authorization", "Basic $encoded")
-        }
-
-        // 任意 HTTP 响应（包括 401/404）表示服务器可达
-        conn.responseCode > 0
-    } catch (e: Exception) {
-        false
-    }
-}
-
-/** 根据服务器类型构建测试 URL */
-private fun buildTestUrl(config: ServerConfig): String {
-    return when (config.type) {
-        ServerType.syncclipboard -> "${config.url.trimEnd('/')}/clipboard"
-        ServerType.webdav -> config.url.trimEnd('/')
-        ServerType.s3 -> {
-            config.url.ifBlank {
-                "https://s3.${config.region ?: "us-east-1"}.amazonaws.com"
+/** 分别从 App 和 SystemUI 执行只读协议检查，不改变当前服务器。 */
+private suspend fun performTestConnection(context: android.content.Context, config: ServerConfig): String =
+    withContext(Dispatchers.IO) {
+        val appResult = try {
+            withTimeout(10_000L) {
+                ClientFactory.createClient(config).use { it.testConnection() }
             }
+            context.getString(R.string.server_test_protocol_success)
+        } catch (_: TimeoutCancellationException) {
+            context.getString(R.string.server_test_timeout)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            context.getString(R.string.server_test_fail) + ": ${e.message}"
         }
+        val payload = Bundle().apply { putString("server", Json.encodeToString(ServerConfig.serializer(), config)) }
+        val reply = SyncClipboardBridge.with(context)
+            .to(io.github.erenche.syncclipboard.common.PackageNames.SYSTEM_UI)
+            .key(BridgeKeys.TEST_CONNECTION)
+            .payload(payload)
+            .await(timeout = 12_000L)
+        val engineResult = when {
+            !reply.containsKey("success") -> context.getString(R.string.server_test_engine_unavailable)
+            reply.getBoolean("success") -> context.getString(R.string.server_test_protocol_success)
+            else -> context.getString(R.string.server_test_fail) + ": " + reply.getString("error").orEmpty()
+        }
+        context.getString(R.string.server_test_process_results, appResult, engineResult)
     }
-}
