@@ -94,6 +94,9 @@ class MainActivity : BaseActivity(), SyncClipboardApp.XposedServiceStateListener
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        io.github.erenche.syncclipboard.bridge.LocalNetworkAccessBridge.send(
+            this, Prefs.loadConfig(this).enableSystemUiLocalNetworkAccess
+        )
         val localNetworkPermission = "android.permission.ACCESS_LOCAL_NETWORK"
         if (checkSelfPermission(localNetworkPermission) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(localNetworkPermission), 1001)
@@ -166,7 +169,7 @@ private val bottomTabs = listOf(
 fun MainScreen(viewModel: MainViewModel) {
     val context = LocalContext.current
 
-    // Push config to SystemUI on startup
+    // 启动时向 SystemUI 同步配置。
     LaunchedEffect(Unit) {
         try {
             val config = Prefs.loadConfig(context)

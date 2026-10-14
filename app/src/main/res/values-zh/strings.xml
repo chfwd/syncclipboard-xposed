@@ -3,13 +3,13 @@
     <string name="app_name">SyncClipboard</string>
     <string name="app_description">用于静默剪贴板同步的 LSPosed 模块</string>
 
-    <!-- Activities -->
+    <!-- 页面 -->
     <string name="activity_settings">设置</string>
     <string name="activity_server_config">服务器配置</string>
     <string name="activity_history">剪贴板历史</string>
     <string name="activity_about">关于</string>
 
-    <!-- Module Status -->
+    <!-- 模块状态 -->
     <string name="module_status_activated">模块已激活</string>
     <string name="module_status_not_activated">模块未激活</string>
     <string name="module_status_connecting">连接中…</string>
@@ -17,7 +17,7 @@
     <string name="module_status_system_ui_safe_mode">System UI 安全模式 — 钩子已禁用</string>
     <string name="module_status_summary">版本 %s</string>
 
-    <!-- Actions -->
+    <!-- 操作 -->
     <string name="action_restart">重启</string>
     <string name="action_sync_now">立即同步</string>
     <string name="action_upload_now">立即上传</string>
@@ -43,14 +43,14 @@
     <string name="action_confirm">确定</string>
     <string name="action_copy">复制</string>
 
-    <!-- Restart -->
+    <!-- 重启 -->
     <string name="restart_system_ui">重启 System UI</string>
     <string name="restart_app">重启应用</string>
     <string name="restart_fail">重启失败</string>
     <string name="message_app_restart_fail">重启失败，请手动重试。</string>
     <string name="ok">确定</string>
 
-    <!-- Server Config -->
+    <!-- 服务器配置 -->
     <string name="server_type_syncclipboard">SyncClipboard 服务器</string>
     <string name="server_type_webdav">WebDAV</string>
     <string name="server_type_s3">S3 兼容存储</string>
@@ -99,7 +99,7 @@
     <string name="server_bucket_hint">my-bucket</string>
     <string name="server_prefix_hint">syncclipboard/</string>
 
-    <!-- Theme -->
+    <!-- 主题 -->
     <string name="setting_theme">主题</string>
     <string name="setting_theme_mode">主题模式</string>
     <string name="setting_blur">模糊</string>
@@ -143,7 +143,13 @@
     <string name="option_theme_light">浅色</string>
     <string name="option_theme_dark">深色</string>
 
-    <!-- Sync Settings -->
+    <!-- 兼容性设置 -->
+    <string name="setting_compatibility_settings">兼容性设置</string>
+    <string name="setting_systemui_local_network">SystemUI 局域网访问兼容</string>
+    <string name="setting_systemui_local_network_summary">允许 SystemUI 在 Android 17 及以上连接局域网服务器，独立于自动同步开关。安装后需启用 Android 系统作用域并重启设备，影响整个 SystemUI UID。</string>
+    <string name="setting_systemui_local_network_unsupported_summary">仅支持 Android 17（API 37）及以上，当前系统无法启用。</string>
+
+    <!-- 同步设置 -->
     <string name="setting_auto_sync">自动同步</string>
     <string name="setting_auto_sync_summary">后台自动同步剪贴板</string>
     <string name="setting_background_upload">后台上传</string>
@@ -197,7 +203,7 @@
     <string name="setting_cache_cleared">缓存已清除</string>
     <string name="setting_cache_clear">清除</string>
 
-    <!-- Items -->
+    <!-- 条目 -->
     <string name="item_server_settings">服务器配置</string>
     <string name="item_server_settings_summary">添加和管理同步服务器</string>
     <string name="item_sync_settings">设置</string>
@@ -236,7 +242,7 @@
     <string name="main_loading">加载中…</string>
     <string name="main_no_content">暂无内容</string>
 
-    <!-- Sync Status -->
+    <!-- 同步状态 -->
     <string name="sync_status_running">运行中</string>
     <string name="sync_status_stopped">已停止</string>
     <string name="sync_status_checking">检查中…</string>
@@ -245,7 +251,7 @@
     <!-- 快捷设置磁贴 -->
     <string name="tile_auto_sync">剪贴板同步</string>
 
-    <!-- History -->
+    <!-- 历史记录 -->
     <string name="history_empty">暂无剪贴板历史</string>
     <string name="history_copy">复制到剪贴板</string>
     <string name="history_delete">删除</string>
@@ -301,7 +307,7 @@
     <string name="transfer_added_single">已加入传输队列</string>
     <string name="transfer_menu_with_count">传输队列 (%1$d)</string>
 
-    <!-- About -->
+    <!-- 关于 -->
     <string name="about_version">版本 %s</string>
     <string name="about_description">用于设备间静默剪贴板同步的 LSPosed 模块。</string>
     <string name="about_supported_backends">支持 SyncClipboard Server、WebDAV 和 S3 兼容存储后端。</string>
@@ -335,7 +341,7 @@
     <string name="oss_androidx">AndroidX / Jetpack Compose</string>
     <string name="oss_androidx_license">Apache 2.0</string>
 
-    <!-- Main Screen -->
+    <!-- 主界面 -->
     <string name="main_sync_status">同步状态: %s</string>
     <string name="main_sync_now_desc">手动触发剪贴板同步</string>
     <string name="main_upload_now_desc">推送当前剪贴板到服务器</string>

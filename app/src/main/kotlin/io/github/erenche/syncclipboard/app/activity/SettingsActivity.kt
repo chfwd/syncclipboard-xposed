@@ -33,6 +33,7 @@ import io.github.erenche.syncclipboard.app.compose.preference.rememberBooleanPre
 import io.github.erenche.syncclipboard.app.util.AppLangUtils
 import io.github.erenche.syncclipboard.app.util.resolveLanguageName
 import io.github.erenche.syncclipboard.bridge.BridgeKeys
+import io.github.erenche.syncclipboard.bridge.LocalNetworkAccessBridge
 import io.github.erenche.syncclipboard.bridge.SyncClipboardBridge
 import io.github.erenche.syncclipboard.common.PackageNames
 import io.github.erenche.syncclipboard.common.Prefs
@@ -123,27 +124,32 @@ fun SettingsScreen(
             SyncSettingsCard(context)
         }
 
-        // 4. 历史记录设置
+        // 4. 兼容性设置
+        item("compatibility") {
+            CompatibilitySettingsCard(context)
+        }
+
+        // 5. 历史记录设置
         item("history") {
             HistorySettingsCard()
         }
 
-        // 5. 日志设置
+        // 6. 日志设置
         item("logging") {
             LoggingSettingsCard(context)
         }
 
-        // 6. 自动保存设置
+        // 7. 自动保存设置
         item("auto_save") {
             AutoSaveSettingsCard(context)
         }
 
-        // 7. 存储清理（缓存 + 引擎数据）
+        // 8. 存储清理（缓存 + 引擎数据）
         item("cache") {
             StorageSettingsCard(context)
         }
 
-        // 8. 关于
+        // 9. 关于
         item("about") {
             Card(
                 modifier = Modifier
@@ -491,6 +497,66 @@ fun SyncSettingsCard(context: android.content.Context) {
             summary = stringResource(R.string.setting_verification_code_auto_cleanup_summary),
             onCheckedChange = { toggleVerificationCodeAutoCleanup(it) }
         )
+    }
+}
+
+// ─── 兼容性设置 ───────────────────────────────────────────────
+@Composable
+private fun CompatibilitySettingsCard(context: android.content.Context) {
+    var config by remember(context) { mutableStateOf(Prefs.loadConfig(context)) }
+    val localNetworkSupported = android.os.Build.VERSION.SDK_INT >= 37
+    DisposableEffect(context) {
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == Prefs.KEY_CONFIG) config = Prefs.loadConfig(context)
+        }
+        Prefs.registerConfigListener(context, listener)
+        onDispose { Prefs.unregisterConfigListener(context, listener) }
+    }
+
+    Column(
+        modifier = Modifier
+            .padding(horizontal = 16.dp)
+            .fillMaxWidth()
+    ) {
+        Text(
+            text = stringResource(R.string.setting_compatibility_settings),
+            modifier = Modifier.padding(start = 12.dp, top = 16.dp, bottom = 8.dp),
+            fontSize = 14.sp,
+            color = MiuixTheme.colorScheme.onSurfaceVariantActions
+        )
+        Card(modifier = Modifier.fillMaxWidth()) {
+            // 保留设置入口，低版本显示关闭状态并禁止操作。
+            SwitchPreference(
+                checked = localNetworkSupported && config.enableSystemUiLocalNetworkAccess,
+                enabled = localNetworkSupported,
+                title = stringResource(R.string.setting_systemui_local_network),
+                summary = stringResource(
+                    if (localNetworkSupported) {
+                        R.string.setting_systemui_local_network_summary
+                    } else {
+                        R.string.setting_systemui_local_network_unsupported_summary
+                    }
+                ),
+                onCheckedChange = { enabled ->
+                    if (localNetworkSupported) {
+                        runCatching {
+                            // 读取最新配置，仅更新兼容性开关，避免覆盖其他分类的设置。
+                            val newConfig = Prefs.loadConfig(context).copy(enableSystemUiLocalNetworkAccess = enabled)
+                            Prefs.saveConfig(context, newConfig)
+                            config = newConfig
+                            LocalNetworkAccessBridge.send(context, enabled)
+                            val configJson = Json.encodeToString(AppConfig.serializer(), newConfig)
+                            val payload = Bundle().apply { putString("config", configJson) }
+                            SyncClipboardBridge.with(context)
+                                .to(PackageNames.SYSTEM_UI)
+                                .key(BridgeKeys.PUSH_CONFIG)
+                                .payload(payload)
+                                .send()
+                        }.onFailure { Logger.warn("Settings", "Failed to update LAN compatibility setting", it) }
+                    }
+                }
+            )
+        }
     }
 }
 
