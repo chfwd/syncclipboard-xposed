@@ -11,8 +11,6 @@ import io.github.erenche.syncclipboard.common.util.Logger
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.cancel
 import io.ktor.client.engine.okhttp.OkHttp
-import io.ktor.client.plugins.logging.LogLevel
-import io.ktor.client.plugins.logging.Logging
 import io.ktor.client.request.header
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
@@ -70,9 +68,6 @@ class S3Client(
     private val isCustomEndpoint: Boolean = !serviceUrl.isNullOrBlank()
 
     private val client = HttpClient(OkHttp) {
-        install(Logging) {
-            level = LogLevel.INFO
-        }
     }
 
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
@@ -202,7 +197,7 @@ class S3Client(
             "SignedHeaders=$signedHeaders, " +
             "Signature=$signature"
 
-        Logger.debug(TAG, "$method $url")
+        Logger.debug(TAG, "S3 request: $method")
 
         return client.request(url) {
             this.method = method
@@ -257,7 +252,7 @@ class S3Client(
             val body = response.bodyAsText()
             json.decodeFromString(ProfileDto.serializer(), body)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to get clipboard from S3", e)
+            Logger.warn(TAG, "Failed to get clipboard from S3")
             null
         }
     }
@@ -272,8 +267,8 @@ class S3Client(
             contentType = "application/json; charset=utf-8"
         )
         if (!response.status.isSuccess()) {
-            val errBody = try { response.bodyAsText() } catch (_: Exception) { "" }
-            throw IllegalStateException("S3 putClipboard failed: ${response.status.value} $errBody")
+            runCatching { response.bodyAsText() }
+            throw IllegalStateException("S3 putClipboard failed: HTTP ${response.status.value}")
         }
     }
 
@@ -311,8 +306,8 @@ class S3Client(
             body = body
         )
         if (!response.status.isSuccess()) {
-            val errBody = try { response.bodyAsText() } catch (_: Exception) { "" }
-            throw IllegalStateException("S3 putFile failed: ${response.status.value} $errBody")
+            runCatching { response.bodyAsText() }
+            throw IllegalStateException("S3 putFile failed: HTTP ${response.status.value}")
         }
         onProgress?.invoke(total, total)
         Logger.info(TAG, "File uploaded to S3: $fileName")
@@ -348,8 +343,8 @@ class S3Client(
             queryString = queryString
         )
         if (!response.status.isSuccess()) {
-            val errBody = try { response.bodyAsText() } catch (_: Exception) { "" }
-            throw IllegalStateException("S3 test connection failed: ${response.status.value} $errBody")
+            runCatching { response.bodyAsText() }
+            throw IllegalStateException("S3 test connection failed: HTTP ${response.status.value}")
         }
         Logger.info(TAG, "S3 connection test successful")
     }

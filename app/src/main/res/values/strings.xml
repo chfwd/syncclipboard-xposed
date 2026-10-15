@@ -196,10 +196,16 @@
     <string name="setting_verification_code_auto_cleanup">Auto-delete Uploaded Codes</string>
     <string name="setting_verification_code_auto_cleanup_summary">Delete the history entry 60 seconds after a code is uploaded and sync the deletion to the server</string>
     <string name="setting_language">Language</string>
+    <string name="setting_language_settings">Language Settings</string>
     <string name="setting_language_auto">Follow system</string>
     <string name="setting_language_zh">中文</string>
     <string name="setting_language_en">English</string>
     <string name="setting_sync_settings">Sync Settings</string>
+    <string name="setting_theme_settings">Appearance Settings</string>
+    <string name="setting_logging_settings">Logging Settings</string>
+    <string name="setting_auto_save_settings">Auto-save Settings</string>
+    <string name="setting_storage_settings">Storage Settings</string>
+    <string name="setting_about_settings">About</string>
     <string name="setting_background_settings">Background Settings</string>
     <string name="setting_history_settings">History Settings</string>
     <string name="setting_cache">Cache</string>
@@ -274,8 +280,8 @@
     <string name="history_page_next">Next</string>
     <string name="history_page_indicator">Page %1$d / %2$d</string>
     <string name="history_page_size">Per page</string>
-    <string name="history_page_size_50">50</string>
-    <string name="history_page_size_100">100</string>
+    <string name="history_page_size_50" translatable="false">50</string>
+    <string name="history_page_size_100" translatable="false">100</string>
     <string name="history_total_count">Total %d items</string>
     <string name="history_selected_count">%d selected</string>
     <string name="history_delete_selected">Delete (%d)</string>
@@ -359,4 +365,12 @@
         <item>zh</item>
         <item>en</item>
     </string-array>
+    <string name="config_pending">Settings saved; application not confirmed. Retrying; check module activation.</string>
+    <string name="config_storage_error">Cannot read or save settings. Unlock and retry; do not clear app data.</string>
+    <string name="local_network_verified">Kernel permission verified. This does not guarantee server connectivity.</string>
+    <string name="local_network_disabled">Compatibility override is disabled and restoration is verified.</string>
+    <string name="local_network_restart_required">System service did not respond. Check Android scope in LSPosed and reboot.</string>
+    <string name="local_network_waiting">Waiting for a supported framework permission interface and its writer thread.</string>
+    <string name="local_network_failed">Could not save the compatibility setting or verify the kernel permission. Retrying automatically; check module logs.</string>
+    <string name="config_remote_storage_error">SystemUI cannot save settings. Original data is retained; retrying automatically.</string>
 </resources>

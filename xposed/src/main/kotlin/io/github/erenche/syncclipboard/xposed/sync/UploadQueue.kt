@@ -55,11 +55,12 @@ object UploadQueue {
     fun snapshot(context: Context, serverKey: String): List<QueuedUpload> {
         return try {
             // 旧队列没有服务器归属，保留原键但不自动重放。
-            val raw = prefs(context).getString("$KEY_QUEUE:$serverKey", null) ?: return emptyList()
+            val raw = Prefs.loadSensitiveString(context, "$KEY_QUEUE:$serverKey") ?: return emptyList()
             json.decodeFromString(ListSerializer(QueuedUpload.serializer()), raw)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to load upload queue: ${e.message}")
-            emptyList()
+            // 不把读取失败当成空队列，避免后续入队覆盖原数据。
+            Logger.warn(TAG, "Upload queue unavailable: ${e.javaClass.simpleName}")
+            throw e
         }
     }
 
@@ -114,11 +115,10 @@ object UploadQueue {
 
     private fun persist(context: Context, serverKey: String, list: List<QueuedUpload>) {
         try {
-            prefs(context).edit()
-                .putString("$KEY_QUEUE:$serverKey", json.encodeToString(ListSerializer(QueuedUpload.serializer()), list))
-                .apply()
+            Prefs.saveSensitiveString(context, "$KEY_QUEUE:$serverKey",
+                json.encodeToString(ListSerializer(QueuedUpload.serializer()), list))
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to persist upload queue: ${e.message}")
+            Logger.warn(TAG, "Failed to persist upload queue: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 }

@@ -196,10 +196,16 @@
     <string name="setting_verification_code_auto_cleanup">自动清理已上传验证码</string>
     <string name="setting_verification_code_auto_cleanup_summary">验证码上传成功 60 秒后删除对应历史，并同步删除服务器端记录</string>
     <string name="setting_language">语言</string>
+    <string name="setting_language_settings">语言设置</string>
     <string name="setting_language_auto">跟随系统</string>
     <string name="setting_language_zh">中文</string>
     <string name="setting_language_en">English</string>
     <string name="setting_sync_settings">同步设置</string>
+    <string name="setting_theme_settings">外观设置</string>
+    <string name="setting_logging_settings">日志设置</string>
+    <string name="setting_auto_save_settings">自动保存设置</string>
+    <string name="setting_storage_settings">存储设置</string>
+    <string name="setting_about_settings">关于</string>
     <string name="setting_background_settings">后台设置</string>
     <string name="setting_history_settings">历史设置</string>
     <string name="setting_cache">缓存</string>
@@ -351,4 +357,12 @@
     <string name="main_upload_now_desc">推送当前剪贴板到服务器</string>
     <string name="main_how_it_works_title">工作原理</string>
     <string name="main_how_it_works_text">此 LSPosed 模块钩入 ClipboardManager，无需轮询即可实时检测剪贴板变更。变更会同步到您配置的服务器（SyncClipboard、WebDAV 或 S3）。</string>
+    <string name="config_pending">设置已保存，暂未确认生效；正在重试，请检查模块是否启用。</string>
+    <string name="config_storage_error">设置无法读取或保存，原数据已保留；请解锁后重试，勿清除应用数据。</string>
+    <string name="local_network_verified">内核权限已验证，不代表服务器一定可连接。</string>
+    <string name="local_network_disabled">兼容性补充已关闭，原始权限恢复已验证。</string>
+    <string name="local_network_restart_required">系统服务未响应，请检查 LSPosed 中的 Android 作用域并重启设备。</string>
+    <string name="local_network_waiting">等待可用的框架权限接口及其写入线程。</string>
+    <string name="local_network_failed">兼容性开关保存失败或内核权限校验失败，正在重试，请检查模块日志。</string>
+    <string name="config_remote_storage_error">SystemUI 无法保存设置，原数据已保留，正在自动重试。</string>
 </resources>

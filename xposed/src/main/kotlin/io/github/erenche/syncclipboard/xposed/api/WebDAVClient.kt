@@ -12,8 +12,6 @@ import io.github.erenche.syncclipboard.common.util.Logger
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.plugins.logging.LogLevel
-import io.ktor.client.plugins.logging.Logging
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.put
@@ -66,9 +64,6 @@ class WebDAVClient(
                 prettyPrint = false
             })
         }
-        install(Logging) {
-            level = LogLevel.INFO
-        }
     }
 
     private fun buildAuthHeader(): String {
@@ -95,7 +90,7 @@ class WebDAVClient(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to get clipboard from WebDAV", e)
+            Logger.warn(TAG, "Failed to get clipboard from WebDAV")
             null
         }
     }
@@ -193,7 +188,7 @@ class WebDAVClient(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Logger.warn(TAG, "ensureDataDirectoryExists: ${e.message}")
+            Logger.warn(TAG, "ensureDataDirectoryExists: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 

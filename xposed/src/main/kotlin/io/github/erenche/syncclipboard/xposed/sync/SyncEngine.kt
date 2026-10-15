@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Bundle
 import android.os.PowerManager
+import io.github.erenche.syncclipboard.bridge.BridgeSecurity
 import io.github.erenche.syncclipboard.bridge.BridgeKeys
 import io.github.erenche.syncclipboard.bridge.SyncClipboardBridge
 import io.github.erenche.syncclipboard.common.PackageNames
@@ -255,6 +256,7 @@ class SyncEngine private constructor() {
         }
 
         config = Prefs.loadConfig(context)
+        scope.launch { Prefs.migrateSensitiveValues(context) }
         // 加载持久化的历史同步游标（增量同步用）
         lastSyncTime = Prefs.loadHistoryLastSyncTime(context)
         // 引擎数据统一目录 filesDir/SyncClipboard/（历史库/归档/下载暂存）
@@ -337,7 +339,7 @@ class SyncEngine private constructor() {
                         val success = try {
                             fetchRemoteClipboard()
                         } catch (e: Exception) {
-                            Logger.error(TAG, "Remote fetch error", e)
+                            Logger.error(TAG, "Remote fetch error")
                             false
                         }
                     if (success) {
@@ -359,7 +361,7 @@ class SyncEngine private constructor() {
                                             syncHistory(force = false)
                                             lastHistorySyncAt = android.os.SystemClock.elapsedRealtime()
                                         } catch (e: Exception) {
-                                            Logger.warn(TAG, "Polling history sync error: ${e.message}")
+                                            Logger.warn(TAG, "Polling history sync error: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                                         }
                                     }
                                 }
@@ -460,7 +462,7 @@ class SyncEngine private constructor() {
             powerStateReceiver = receiver
             Logger.info(TAG, "Power state monitor registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register power state monitor: ${e.message}")
+            Logger.warn(TAG, "Failed to register power state monitor: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -543,7 +545,7 @@ class SyncEngine private constructor() {
                         Logger.info(TAG, "Catch-up fetch after resume")
                         fetchRemoteClipboard(force = true)
                     } catch (e: Exception) {
-                        Logger.warn(TAG, "Catch-up fetch after resume failed: ${e.message}")
+                        Logger.warn(TAG, "Catch-up fetch after resume failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     }
                 }
             }
@@ -585,7 +587,7 @@ class SyncEngine private constructor() {
             handleNetworkChange(cm) // 初始化当前状态
             Logger.info(TAG, "Network monitor registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register network monitor: ${e.message}")
+            Logger.warn(TAG, "Failed to register network monitor: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -637,7 +639,7 @@ class SyncEngine private constructor() {
             uninstallReceiver = receiver
             Logger.info(TAG, "Uninstall monitor registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register uninstall monitor: ${e.message}")
+            Logger.warn(TAG, "Failed to register uninstall monitor: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -648,13 +650,7 @@ class SyncEngine private constructor() {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
                     if (intent.action != BridgeKeys.ACTION_NOTIF_CAPTURE) return
-                    // 信任校验：发送方应为 system_server(1000)，或本模块进程（SystemUI/本 App）——
-                    // 实测 system_server 发出的广播在部分 ROM 上到达时被归属为 SystemUI 的 uid，不能只放行 1000。
-                    val uid = android.os.Binder.getCallingUid()
-                    if (uid != android.os.Process.SYSTEM_UID) {
-                        val pkgs = context.packageManager.getPackagesForUid(uid).orEmpty()
-                        if (PackageNames.SYSTEM_UI !in pkgs && PackageNames.APPLICATION !in pkgs) return
-                    }
+                    if (!BridgeSecurity.isTrustedSender(context, this, BridgeSecurity.PERMISSION_SYSTEM_EVENT)) return
                     val body = intent.getStringExtra(BridgeKeys.EXTRA_NOTIF_BODY) ?: return
                     val pkg = intent.getStringExtra(BridgeKeys.EXTRA_NOTIF_PKG) ?: "?"
                     handleCapturedBody(pkg, body)
@@ -663,12 +659,13 @@ class SyncEngine private constructor() {
             androidx.core.content.ContextCompat.registerReceiver(
                 ctx, receiver,
                 IntentFilter(BridgeKeys.ACTION_NOTIF_CAPTURE),
+                BridgeSecurity.PERMISSION_SYSTEM_EVENT, null,
                 androidx.core.content.ContextCompat.RECEIVER_EXPORTED
             )
             notifCaptureReceiver = receiver
             Logger.info(TAG, "Notif-capture monitor registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register notif capture monitor: ${e.message}")
+            Logger.warn(TAG, "Failed to register notif capture monitor: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -700,7 +697,7 @@ class SyncEngine private constructor() {
             cm.addPrimaryClipChangedListener(clipChangedListener)
             Logger.info(TAG, "OnPrimaryClipChangedListener registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register clip listener: ${e.message}")
+            Logger.warn(TAG, "Failed to register clip listener: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -914,7 +911,7 @@ class SyncEngine private constructor() {
                     // 历史同步改为手动触发，上传后不再自动 syncHistory
                 }
             } catch (e: Exception) {
-                Logger.error(TAG, "Error handling local clipboard change", e)
+                Logger.error(TAG, "Error handling local clipboard change")
             }
         }
     }
@@ -1014,7 +1011,7 @@ class SyncEngine private constructor() {
                     message = "Sync failed"
                 }
             } catch (e: Exception) {
-                Logger.error(TAG, "Force sync failed", e)
+                Logger.error(TAG, "Force sync failed")
                 message = "Sync error: ${e.message}"
             }
             notifyActionResult("sync", success, message)
@@ -1086,7 +1083,7 @@ class SyncEngine private constructor() {
                     }
                 }
             } catch (e: Exception) {
-                Logger.warn(TAG, "syncHistory: getServerTime failed (non-fatal): ${e.message}")
+                Logger.warn(TAG, "syncHistory: getServerTime failed (non-fatal): ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             }
 
             // 1. 分页拉取服务器记录（与 RN fetchRemoteRecords 一致）
@@ -1175,7 +1172,7 @@ class SyncEngine private constructor() {
             val activeFetched = allRecords.count { it.isDeleted != true }
             return SyncHistoryResult(true, activeFetched, null)
         } catch (e: Exception) {
-            Logger.warn(TAG, "syncHistory failed: ${e.message}", e)
+            Logger.warn(TAG, "syncHistory failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             return SyncHistoryResult(false, 0, e.message ?: "Unknown error")
         } finally {
             // 统一落盘一次（批量模式期间的所有变更）
@@ -1265,7 +1262,7 @@ class SyncEngine private constructor() {
                 PatchOutcome.SUCCESS
             }
         } catch (e: Exception) {
-            Logger.warn(TAG, "syncHistory: PATCH failed for ${item.profileHash}: ${e.message}")
+            Logger.warn(TAG, "syncHistory: PATCH failed for ${item.profileHash}: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             PatchOutcome.FAILED
         }
     }
@@ -1297,7 +1294,7 @@ class SyncEngine private constructor() {
                 PostOutcome.FAILED
             }
         } catch (e: Exception) {
-            Logger.warn(TAG, "syncHistory: POST failed for ${item.profileHash}: ${e.message}")
+            Logger.warn(TAG, "syncHistory: POST failed for ${item.profileHash}: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             PostOutcome.FAILED
         }
     }
@@ -1345,7 +1342,7 @@ class SyncEngine private constructor() {
                 // 历史同步改为手动触发，上传后不再自动 syncHistory
                 message = if (success) "Upload OK" else "Upload failed"
             } catch (e: Exception) {
-                Logger.error(TAG, "Force upload failed", e)
+                Logger.error(TAG, "Force upload failed")
                 message = "Upload error: ${e.message}"
             }
             notifyActionResult("upload", success, message)
@@ -1383,7 +1380,7 @@ class SyncEngine private constructor() {
                         )
                         Logger.info(TAG, "uploadText: copied to clipboard")
                     } catch (e: Exception) {
-                        Logger.warn(TAG, "uploadText: clipboard copy failed: ${e.message}")
+                        Logger.warn(TAG, "uploadText: clipboard copy failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     }
                 }
                 // 不再依赖 60 秒后的剪贴板清理来复位去重标记；仅保留短时窗口抑制本次 setPrimaryClip 的回声。
@@ -1414,7 +1411,7 @@ class SyncEngine private constructor() {
                 // 历史同步改为手动触发，上传后不再自动 syncHistory
                 Logger.info(TAG, "uploadText: ok=$ok hash=${profileHash.take(12)}, verification=$verificationCode")
             } catch (e: Exception) {
-                Logger.error(TAG, "uploadText failed", e)
+                Logger.error(TAG, "uploadText failed")
             }
         }
     }
@@ -1478,7 +1475,7 @@ class SyncEngine private constructor() {
                     throw e
                 } catch (e: Exception) {
                     // 本地数据库暂不可用时保留持久化任务，并在当前进程内继续重试。
-                    Logger.warn(TAG, "Verification cleanup failed for ${key.take(12)}: ${e.message}")
+                    Logger.warn(TAG, "Verification cleanup failed for ${key.take(12)}: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     delay(30_000L)
                 }
             }
@@ -1597,7 +1594,7 @@ class SyncEngine private constructor() {
                     if (input != null) HashUtils.computeFileHash(fileName, input)
                     else HashUtils.sha256(fileName)
                 } catch (e: Exception) {
-                    Logger.warn(TAG, "registerUploadedContent: hash fallback: ${e.message}")
+                    Logger.warn(TAG, "registerUploadedContent: hash fallback: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     HashUtils.sha256(fileName)
                 }
                 val content = ClipboardContent(
@@ -1627,7 +1624,7 @@ class SyncEngine private constructor() {
                 notifyContentChanged()
                 Logger.info(TAG, "registerUploadedContent: hash=${hash.take(12)}, name=$fileName")
             } catch (e: Exception) {
-                Logger.error(TAG, "registerUploadedContent failed", e)
+                Logger.error(TAG, "registerUploadedContent failed")
             }
         }
     }
@@ -1666,7 +1663,7 @@ class SyncEngine private constructor() {
                 notifyContentChanged()
                 Logger.info(TAG, "clearEngineData: engine local data cleared")
             } catch (e: Exception) {
-                Logger.warn(TAG, "clearEngineData failed: ${e.message}")
+                Logger.warn(TAG, "clearEngineData failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             }
         }
     }
@@ -1721,7 +1718,7 @@ class SyncEngine private constructor() {
             throw e
         } catch (e: Exception) {
             setConnected(false)
-            Logger.warn(TAG, "Remote fetch error", e)
+            Logger.warn(TAG, "Remote fetch error")
             return false
         } finally {
             isFetching = false
@@ -1736,7 +1733,7 @@ class SyncEngine private constructor() {
                     try {
                         fetchRemoteClipboard(force = true)
                     } catch (e: Exception) {
-                        Logger.warn(TAG, "Queued force fetch failed", e)
+                        Logger.warn(TAG, "Queued force fetch failed")
                     }
                 }
             }
@@ -1821,7 +1818,7 @@ class SyncEngine private constructor() {
             try {
                 downloadAndApplyContent(profile, serverKey)
             } catch (e: Exception) {
-                Logger.error(TAG, "Background download and apply failed", e)
+                Logger.error(TAG, "Background download and apply failed")
             }
         }
     }
@@ -1842,7 +1839,7 @@ class SyncEngine private constructor() {
         // 队列重放属于后台自动同步行为，总开关关闭时不重放（手动上传不受影响）
         if (!config.enableAutoSync) return
         val serverKey = config.serverStorageKey()
-        if (UploadQueue.isEmpty(context, serverKey)) return
+        if (runCatching { UploadQueue.isEmpty(context, serverKey) }.getOrDefault(true)) return
         if (!uploadQueueFlushing.compareAndSet(false, true)) return
         scope.launch {
             try {
@@ -1864,7 +1861,7 @@ class SyncEngine private constructor() {
                     }
                 }
             } catch (e: Exception) {
-                Logger.warn(TAG, "Upload queue flush error: ${e.message}")
+                Logger.warn(TAG, "Upload queue flush error: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             } finally {
                 uploadQueueFlushing.set(false)
                 if (config.serverStorageKey() != serverKey) flushUploadQueue(context)
@@ -1929,7 +1926,7 @@ class SyncEngine private constructor() {
             Logger.info(TAG, "Content uploaded successfully")
             return true
         } catch (e: Exception) {
-            Logger.error(TAG, "Upload failed", e)
+            Logger.error(TAG, "Upload failed")
             return false
         }
     }
@@ -1964,7 +1961,7 @@ class SyncEngine private constructor() {
             Logger.debug(TAG, "Copied URI to temp file: $uriString -> ${tempFile.absolutePath}")
             tempFile
         } catch (e: Exception) {
-            Logger.error(TAG, "Failed to copy URI to temp file: $uriString", e)
+            Logger.error(TAG, "Failed to copy URI to temp file: $uriString")
             null
         }
     }
@@ -2031,7 +2028,7 @@ class SyncEngine private constructor() {
                     Logger.debug(TAG, "downloadAndApplyContent: auto-saving file")
                     autoSaveToFile(context, downloadedFilePath!!, profile.type, profile.dataName)
                 } catch (e: Exception) {
-                    Logger.warn(TAG, "Auto save failed: ${e.message}")
+                    Logger.warn(TAG, "Auto save failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                 }
             }
 
@@ -2060,7 +2057,7 @@ class SyncEngine private constructor() {
             lastSyncTime = System.currentTimeMillis()
             Logger.info(TAG, "Remote content applied to local clipboard")
         } catch (e: Exception) {
-            Logger.error(TAG, "Download and apply failed", e)
+            Logger.error(TAG, "Download and apply failed")
         }
     }
 
@@ -2134,7 +2131,7 @@ class SyncEngine private constructor() {
 
             Logger.debug(TAG, "Written to clipboard: textLength=${text.length}")
         } catch (e: Exception) {
-            Logger.error(TAG, "Failed to write to clipboard", e)
+            Logger.error(TAG, "Failed to write to clipboard")
         }
     }
 
@@ -2154,7 +2151,7 @@ class SyncEngine private constructor() {
 
             Logger.info(TAG, "Written URI to clipboard: $uri, mime=$mime, label=$label")
         } catch (e: Exception) {
-            Logger.error(TAG, "Failed to write URI to clipboard, falling back to text", e)
+            Logger.error(TAG, "Failed to write URI to clipboard, falling back to text")
             writeToClipboard(label)
         }
     }
@@ -2165,9 +2162,9 @@ class SyncEngine private constructor() {
         try {
             val intent = Intent(BridgeKeys.EVENT_CLIPBOARD_CHANGED)
                 .setPackage("io.github.erenche.syncclipboard")
-            context.sendBroadcast(intent)
+            BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to notify content changed: ${e.message}")
+            Logger.warn(TAG, "Failed to notify content changed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -2185,9 +2182,9 @@ class SyncEngine private constructor() {
         try {
             val intent = Intent(BridgeKeys.EVENT_SYNC_STATE_CHANGED)
                 .setPackage("io.github.erenche.syncclipboard")
-            context.sendBroadcast(intent)
+            BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to notify sync state changed: ${e.message}")
+            Logger.warn(TAG, "Failed to notify sync state changed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -2203,9 +2200,9 @@ class SyncEngine private constructor() {
                 .putExtra("action", action)
                 .putExtra("success", success)
                 .putExtra("message", message ?: "")
-            context.sendBroadcast(intent)
+            BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to notify action result: ${e.message}")
+            Logger.warn(TAG, "Failed to notify action result: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -2219,9 +2216,9 @@ class SyncEngine private constructor() {
                 .putExtra("fetched", fetched)
                 .putExtra("count", count)
             if (error != null) intent.putExtra("error", error)
-            context.sendBroadcast(intent)
+            BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to notify history sync completed: ${e.message}")
+            Logger.warn(TAG, "Failed to notify history sync completed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -2232,7 +2229,7 @@ class SyncEngine private constructor() {
             try {
                 ClientSession(config.serverStorageKey(), ClientFactory.createClient(server))
             } catch (e: Exception) {
-                Logger.warn(TAG, "Failed to create API client: ${e.message}")
+                Logger.warn(TAG, "Failed to create API client: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                 null
             }
         } else {
@@ -2290,7 +2287,7 @@ class SyncEngine private constructor() {
                     try {
                         fetchRemoteClipboard(force = true)
                     } catch (e: Exception) {
-                        Logger.warn(TAG, "SignalR push fetch failed", e)
+                        Logger.warn(TAG, "SignalR push fetch failed")
                     }
                 }
             }
@@ -2311,7 +2308,7 @@ class SyncEngine private constructor() {
                             Logger.info(TAG, "SignalR reconnected, triggering catch-up fetch")
                             fetchRemoteClipboard(force = true)
                         } catch (e: Exception) {
-                            Logger.warn(TAG, "Catch-up fetch on SignalR reconnect failed: ${e.message}")
+                            Logger.warn(TAG, "Catch-up fetch on SignalR reconnect failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                         }
                     }
                     // 断连期间可能漏掉历史推送：重连后立即补一次历史增量同步
@@ -2323,7 +2320,7 @@ class SyncEngine private constructor() {
                                 lastHistorySyncAt = android.os.SystemClock.elapsedRealtime()
                             }
                         } catch (e: Exception) {
-                            Logger.warn(TAG, "Catch-up history sync on reconnect failed: ${e.message}")
+                            Logger.warn(TAG, "Catch-up history sync on reconnect failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                         }
                     }
                     // 网络可达：顺带重放上传失败队列
@@ -2336,7 +2333,7 @@ class SyncEngine private constructor() {
             startHistoryPushConsumer()
             Logger.info(TAG, "SignalR client created for server: ${server.url}")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to create SignalR client: ${e.message}")
+            Logger.warn(TAG, "Failed to create SignalR client: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -2349,7 +2346,7 @@ class SyncEngine private constructor() {
                 try {
                     handleRemoteHistoryChanged(push.record, push.serverKey)
                 } catch (e: Exception) {
-                    Logger.warn(TAG, "History push consumer error: ${e.message}")
+                    Logger.warn(TAG, "History push consumer error: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                 }
             }
         }
@@ -2369,7 +2366,7 @@ class SyncEngine private constructor() {
                 // 通知 app 端历史记录已变化，触发 UI 刷新
                 notifyContentChanged()
             } catch (e: Exception) {
-                Logger.warn(TAG, "Failed to merge remote history push: ${e.message}")
+                Logger.warn(TAG, "Failed to merge remote history push: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             }
         }
     }
@@ -2397,7 +2394,7 @@ class SyncEngine private constructor() {
                 Logger.info(TAG, "pushSingleHistoryUpdate: hash=${current.profileHash}, outcome=$outcome")
                 outcome
             } catch (e: Exception) {
-                Logger.warn(TAG, "pushSingleHistoryUpdate failed: ${e.message}")
+                Logger.warn(TAG, "pushSingleHistoryUpdate failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                 PatchOutcome.FAILED
             }
         }
@@ -2429,7 +2426,36 @@ class SyncEngine private constructor() {
                     retryDelayMs = (retryDelayMs * 2).coerceAtMost(5 * 60_000L)
                 }
             } catch (e: Exception) {
-                Logger.warn(TAG, "Pending history delete flush failed: ${e.message}")
+                Logger.warn(TAG, "Pending history delete flush failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
+            }
+        }
+    }
+
+    @Synchronized
+    private fun applyAppConfig(context: Context, data: Bundle): Bundle {
+        val revision = data.getLong("revision", 0)
+        val prefs = Prefs.getPrefs(context)
+        val applied = prefs.getLong("applied_app_revision", 0)
+        return try {
+            check(io.github.erenche.syncclipboard.bridge.ConfigRevisionPolicy.accepts(revision, applied))
+            val raw = requireNotNull(data.getString("config"))
+            val next = Json.decodeFromString(AppConfig.serializer(), raw)
+            check(revision != applied || next == config) { "Config revision conflict" }
+            if (next != config || revision != applied) {
+                Prefs.saveConfig(context, next)
+                onConfigChanged(next)
+                check(prefs.edit().putLong("applied_app_revision", revision).commit())
+            }
+            Bundle().apply {
+                putBoolean("applied", true)
+                putLong("revision", revision)
+            }
+        } catch (e: Exception) {
+            Logger.warn(TAG, "Config not applied: ${e.javaClass.simpleName}")
+            Bundle().apply {
+                putBoolean("applied", false)
+                putLong("revision", applied)
+                if (Prefs.configStorageError) putString("error", "storage_unavailable")
             }
         }
     }
@@ -2442,14 +2468,20 @@ class SyncEngine private constructor() {
             }
 
             onCommand(BridgeKeys.PUSH_CONFIG) { data ->
+                // 已启用版本协议后，忽略旧版单向更新，避免重排覆盖。
+                if (Prefs.getPrefs(context).getLong("applied_app_revision", 0) > 0) return@onCommand
                 val configJson = data.getString("config") ?: return@onCommand
                 try {
                     val newConfig = Json.decodeFromString(AppConfig.serializer(), configJson)
-                    onConfigChanged(newConfig)
                     Prefs.saveConfig(context, newConfig)
+                    onConfigChanged(newConfig)
                 } catch (e: Exception) {
-                    Logger.error(TAG, "Failed to parse config", e)
+                    Logger.warn(TAG, "Config update failed: ${e.javaClass.simpleName}")
                 }
+            }
+
+            onQuery(BridgeKeys.APPLY_CONFIG) {
+                reply(applyAppConfig(context, data))
             }
 
             onQuery(BridgeKeys.GET_SYNC_STATUS) {
@@ -2472,7 +2504,7 @@ class SyncEngine private constructor() {
                         try {
                             fetchRemoteClipboard(force = true)
                         } catch (e: Exception) {
-                            Logger.warn(TAG, "GET_CURRENT_CLIPBOARD: async fetch failed", e)
+                            Logger.warn(TAG, "GET_CURRENT_CLIPBOARD: async fetch failed")
                         }
                     }
                 }
@@ -2560,7 +2592,7 @@ class SyncEngine private constructor() {
                 } catch (e: Exception) {
                     // open 成功但 reply 前异常：立即关闭，避免 SystemUI 侧泄露
                     runCatching { pfd?.close() }
-                    Logger.warn(TAG, "GET_DOWNLOADED_FILE failed: ${e.message}")
+                    Logger.warn(TAG, "GET_DOWNLOADED_FILE failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     reply(Bundle.EMPTY)
                 }
             }
@@ -2673,10 +2705,10 @@ class SyncEngine private constructor() {
                     }
                     reply(Bundle().apply { putBoolean("success", true) })
                 } catch (e: Exception) {
-                    Logger.error(TAG, "Test connection failed", e)
+                    Logger.error(TAG, "Test connection failed")
                     reply(Bundle().apply {
                         putBoolean("success", false)
-                        putString("error", e.message ?: "Connection failed")
+                        putString("error", io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e))
                     })
                 }
             }

@@ -88,7 +88,7 @@ class SyncClipboardHttpClient(
                     header(HttpHeaders.Authorization, buildAuthHeader())
                 }
             }
-            Logger.debug(TAG, "GET $baseUrl$CLIPBOARD_ENDPOINT -> status=${response.status.value}")
+            Logger.debug(TAG, "GET $CLIPBOARD_ENDPOINT -> status=${response.status.value}")
             if (response.status.value !in 200..299) {
                 // 错误响应也可能包含远端剪贴板内容，消费但不写入日志。
                 runCatching { response.bodyAsText() }
@@ -97,7 +97,7 @@ class SyncClipboardHttpClient(
             }
             response.body<ProfileDto>()
         } catch (e: Exception) {
-            Logger.error(TAG, "Failed to get clipboard: ${e.message}", e)
+            Logger.error(TAG, "Failed to get clipboard: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             null
         }
     }
@@ -233,7 +233,7 @@ class SyncClipboardHttpClient(
                 15 -> "All"
                 else -> "All"
             }
-            Logger.info(TAG, "queryHistoryRecords: POST $baseUrl$HISTORY_API/query, page=$page, modifiedAfter=$modifiedAfter, types=$typesName")
+            Logger.info(TAG, "queryHistoryRecords: POST $HISTORY_API/query, page=$page, modifiedAfter=$modifiedAfter, types=$typesName")
 
             val response = client.submitFormWithBinaryData(
                 url = "$baseUrl$HISTORY_API/query",
@@ -264,7 +264,7 @@ class SyncClipboardHttpClient(
             Logger.info(TAG, "queryHistoryRecords: parsed ${records.size} records, hashes=${records.map { it.hash.take(8) }}")
             records
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to query history records: ${e.javaClass.simpleName}: ${e.message}", e)
+            Logger.warn(TAG, "Failed to query history records: ${e.javaClass.simpleName}: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             throw e
         }
     }
@@ -329,7 +329,7 @@ class SyncClipboardHttpClient(
             val rawHash = record.hash
             getHistoryRecord("${record.type.name}-$rawHash")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to upload history record: ${e.message}")
+            Logger.warn(TAG, "Failed to upload history record: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             null
         }
     }
@@ -398,7 +398,7 @@ class SyncClipboardHttpClient(
             }
             json.decodeFromString(HistoryRecordDto.serializer(), body)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to update history record: ${e.message}")
+            Logger.warn(TAG, "Failed to update history record: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             // null 只表示明确的 404；网络异常与 5xx 必须向上传递，
             // 否则删除逻辑会把临时失败误判为“服务器已不存在”并丢掉重试墓碑。
             throw e
@@ -435,7 +435,7 @@ class SyncClipboardHttpClient(
             Logger.info(TAG, "downloadHistoryData: saved to $destinationPath")
             destinationPath
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to download history data: ${e.message}")
+            Logger.warn(TAG, "Failed to download history data: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             null
         }
     }
@@ -459,7 +459,7 @@ class SyncClipboardHttpClient(
             val body = response.bodyAsText()
             json.decodeFromString(HistoryRecordDto.serializer(), body)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to get history record: ${e.message}")
+            Logger.warn(TAG, "Failed to get history record: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             null
         }
     }
@@ -479,7 +479,7 @@ class SyncClipboardHttpClient(
             val body = response.bodyAsText()
             json.decodeFromString(HistoryStatisticsDto.serializer(), body)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to get history statistics: ${e.message}")
+            Logger.warn(TAG, "Failed to get history statistics: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             null
         }
     }
@@ -507,7 +507,7 @@ class SyncClipboardHttpClient(
                 }
             }
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to get server time: ${e.message}")
+            Logger.warn(TAG, "Failed to get server time: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             null
         }
     }

@@ -18,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -90,31 +91,17 @@ private fun ServerEditHost(
     onFinished: (changed: Boolean) -> Unit,
 ) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
     var appConfig by remember { mutableStateOf(Prefs.loadConfig(context)) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
     val effectiveIndex = serverIndex.takeIf { it in appConfig.servers.indices } ?: -1
     val editingServer = effectiveIndex.takeIf { it >= 0 }?.let { appConfig.servers[it] }
 
-    fun saveAndFinish(config: AppConfig) {
-        Prefs.saveConfig(context, config)
+    fun saveAndFinish(config: AppConfig): Boolean {
+        if (!io.github.erenche.syncclipboard.app.ConfigSyncCoordinator.save(context, config)) return false
         appConfig = config
-        scope.launch {
-            try {
-                val configJson = Json.encodeToString(AppConfig.serializer(), config)
-                val payload = Bundle().apply { putString("config", configJson) }
-                SyncClipboardBridge.with(context)
-                    .to("com.android.systemui")
-                    .key(BridgeKeys.PUSH_CONFIG)
-                    .payload(payload)
-                    .send()
-            } catch (_: Exception) {
-                // 配置已经持久化；SystemUI 下次启动或配置刷新时会重新读取。
-            } finally {
-                onFinished(true)
-            }
-        }
+        onFinished(true)
+        return true
     }
 
     ServerEditPage(
@@ -156,12 +143,11 @@ private fun ServerEditHost(
             if (appConfig.activeServerIndex < 0) {
                 newConfig = newConfig.copy(activeServerIndex = 0)
             }
-            Toast.makeText(
-                context,
-                if (effectiveIndex >= 0) R.string.server_updated else R.string.server_added,
-                Toast.LENGTH_SHORT
-            ).show()
-            saveAndFinish(newConfig)
+            if (saveAndFinish(newConfig)) {
+                Toast.makeText(context,
+                    if (effectiveIndex >= 0) R.string.server_updated else R.string.server_added,
+                    Toast.LENGTH_SHORT).show()
+            }
         }
     )
 }
@@ -199,14 +185,7 @@ fun ServerConfigScreen(
         )
     }
 
-    // Push current config to both app and systemui process on screen load
-    LaunchedEffect(Unit) {
-        try {
-            val configJson = Json.encodeToString(AppConfig.serializer(), appConfig)
-            val payload = android.os.Bundle().apply { putString("config", configJson) }
-            SyncClipboardBridge.with(context).to("com.android.systemui").key(BridgeKeys.PUSH_CONFIG).payload(payload).send()
-        } catch (_: Exception) {}
-    }
+    LaunchedEffect(Unit) { io.github.erenche.syncclipboard.app.ConfigSyncCoordinator.retry() }
 
     ServerListPane(
         appConfig = appConfig,
@@ -388,6 +367,7 @@ private fun ServerEditPage(
     onSave: (ServerConfig) -> Unit
 ) {
     val context = LocalContext.current
+    val resources = LocalResources.current
     val scope = rememberCoroutineScope()
     val isEditing = server != null
 
@@ -420,15 +400,15 @@ private fun ServerEditPage(
     /** 必填字段校验，返回错误提示（null 表示通过） */
     fun validateForm(): String? = when (serverType) {
         ServerType.s3 -> when {
-            username.isBlank() -> context.getString(R.string.server_access_key_required)
-            password.isBlank() -> context.getString(R.string.server_secret_key_required)
-            bucketName.isBlank() -> context.getString(R.string.server_bucket_required)
+            username.isBlank() -> resources.getString(R.string.server_access_key_required)
+            password.isBlank() -> resources.getString(R.string.server_secret_key_required)
+            bucketName.isBlank() -> resources.getString(R.string.server_bucket_required)
             else -> null
         }
         else -> when {
-            url.isBlank() -> context.getString(R.string.server_url_required)
-            username.isBlank() -> context.getString(R.string.server_username_required)
-            password.isBlank() -> context.getString(R.string.server_password_required)
+            url.isBlank() -> resources.getString(R.string.server_url_required)
+            username.isBlank() -> resources.getString(R.string.server_username_required)
+            password.isBlank() -> resources.getString(R.string.server_password_required)
             else -> null
         }
     }
@@ -609,7 +589,7 @@ private fun ServerEditPage(
                         // 测试允许 URL 为空（S3），只校验非 S3 的 URL
                         val testError = when (serverType) {
                             ServerType.s3 -> null
-                            else -> if (url.isBlank()) context.getString(R.string.server_url_required) else null
+                            else -> if (url.isBlank()) resources.getString(R.string.server_url_required) else null
                         }
                         if (testError != null) {
                             Toast.makeText(context, testError, Toast.LENGTH_SHORT).show()
@@ -630,7 +610,7 @@ private fun ServerEditPage(
                             } catch (e: Exception) {
                                 Toast.makeText(
                                     context,
-                                    context.getString(R.string.server_test_fail) + ": ${e.message}",
+                                    resources.getString(R.string.server_test_fail) + ": ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}",
                                     Toast.LENGTH_SHORT
                                 ).show()
                             } finally {
@@ -814,7 +794,7 @@ private suspend fun performTestConnection(context: android.content.Context, conf
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            context.getString(R.string.server_test_fail) + ": ${e.message}"
+            context.getString(R.string.server_test_fail) + ": ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}"
         }
         val payload = Bundle().apply { putString("server", Json.encodeToString(ServerConfig.serializer(), config)) }
         val reply = SyncClipboardBridge.with(context)

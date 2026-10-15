@@ -5,10 +5,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.SparseIntArray
 import io.github.erenche.syncclipboard.bridge.LocalNetworkAccessBridge
+import io.github.erenche.syncclipboard.bridge.BridgeSecurity
+import io.github.erenche.syncclipboard.bridge.IBridgeCallback
 import io.github.erenche.syncclipboard.bridge.SyncClipboardBridge
 import io.github.erenche.syncclipboard.common.PackageNames
 import io.github.erenche.syncclipboard.common.util.Logger
@@ -28,7 +31,7 @@ object SystemLocalNetworkHooker {
     // Connectivity 模块经 jarjar 打包，部分 ROM 上内部类名带此前缀。
     private const val JARJAR_PREFIX = "android.net.connectivity."
     // system_server 的系统 Context 没有数据目录，不能用 SharedPreferences。
-    private val settingFile = File("/data/system/syncclipboard_local_network")
+    private val settingStore = LocalNetworkSettingStore(File("/data/system/syncclipboard_local_network"))
 
     private val handles = mutableListOf<XposedInterface.HookHandle>()
     private val hookedClasses = HashSet<Class<*>>()
@@ -41,7 +44,7 @@ object SystemLocalNetworkHooker {
     private var callbacks: Handler? = null
     @Volatile private var writeHandler: Handler? = null
     @Volatile private var running = false
-    @Volatile private var enabled = true
+    private val enabled: Boolean get() = settingStore.enabled
     @Volatile private var systemUiUid = -1
     @Volatile private var activeWriter: Writer? = null
     @Volatile private var loggedGrant = false
@@ -228,24 +231,31 @@ object SystemLocalNetworkHooker {
 
     @Synchronized
     private fun attachContext(candidate: Context?) {
-        if (!running || candidate == null) return
+        if (Build.VERSION.SDK_INT < 37 || !running || candidate == null) return
         if (callbacks == null) callbacks = Looper.getMainLooper()?.let { Handler(it) }
         context = candidate
         if (systemUiUid < 0) {
             systemUiUid = runCatching { candidate.packageManager.getApplicationInfo(PackageNames.SYSTEM_UI, 0).uid }.getOrDefault(-1)
         }
         if (receiver != null || systemUiUid < 0) return
-        enabled = runCatching { settingFile.readText().trim() != "0" }.getOrDefault(true)
+        runCatching { settingStore.load() }
+            .onFailure { Logger.warn(TAG, "Cannot load LAN setting; override disabled: ${it.message}") }
         runCatching {
             val r = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context, intent: Intent) {
-                    if (intent.action != LocalNetworkAccessBridge.ACTION || !intent.hasExtra(LocalNetworkAccessBridge.EXTRA_ENABLED)) return
-                    enabled = intent.getBooleanExtra(LocalNetworkAccessBridge.EXTRA_ENABLED, true)
-                    runCatching { settingFile.writeText(if (enabled) "1" else "0") }
-                        .onFailure { Logger.warn(TAG, "Cannot persist LAN setting: ${it.message}") }
-                    Logger.info(TAG, "SystemUI uid=$systemUiUid LAN override enabled=$enabled")
-                    loggedGrant = false
-                    scheduleRefresh()
+                    if (!running || intent.action != LocalNetworkAccessBridge.ACTION ||
+                        !BridgeSecurity.isTrustedSender(ctx, this, SyncClipboardBridge.PERMISSION_BRIDGE)) return
+                    val update = intent.hasExtra(LocalNetworkAccessBridge.EXTRA_ENABLED)
+                    if (update) {
+                        val requested = intent.getBooleanExtra(LocalNetworkAccessBridge.EXTRA_ENABLED, false)
+                        runCatching { settingStore.update(requested) }
+                            .onFailure { Logger.warn(TAG, "Cannot persist LAN setting: ${it.message}") }
+                        Logger.info(TAG, "SystemUI uid=$systemUiUid LAN override enabled=$enabled")
+                        loggedGrant = false
+                    }
+                    val callback = intent.extras?.getBinder(LocalNetworkAccessBridge.EXTRA_CALLBACK)
+                        ?.let { IBridgeCallback.Stub.asInterface(it) }
+                    scheduleRefresh(callback, refresh = update)
                 }
             }
             // onReceive 中的 Binder UID 不能标识发送方，使用签名权限限制广播来源。
@@ -256,29 +266,54 @@ object SystemLocalNetworkHooker {
         }.onFailure { Logger.warn(TAG, "LAN setting receiver not ready: ${it.message}") }
     }
 
-    private fun scheduleRefresh() {
-        val handler = writeHandler ?: run {
+    private fun scheduleRefresh(callback: IBridgeCallback? = null, refresh: Boolean = true) {
+        val handler = writeHandler
+        if (refresh && handler == null) {
             Logger.info(TAG, "LAN refresh pending: waiting for the framework permission writer")
-            return
         }
-        handler.post {
+        (handler ?: callbacks)?.post {
             if (!running) return@post
-            val writer = activeWriter ?: return@post
-            if (systemUiUid < 0 || backend == null) return@post
-            val target = LocalNetworkPermissionPolicy.permissionId(systemUiUid, appIdKeyed = !writer.chunk)
+            if (refresh && handler != null) refreshPermission()
+            // 补写与回执在同一任务内执行，避免先回复旧状态。
+            callback?.let { runCatching { it.onReply(permissionStatus()) } }
+        }
+    }
+
+    private fun refreshPermission() {
+        val writer = activeWriter ?: return
+        if (systemUiUid < 0 || backend == null) return
+        val target = LocalNetworkPermissionPolicy.permissionId(systemUiUid, appIdKeyed = !writer.chunk)
+        runCatching {
+            val key = baselineKey(writer, target)
+            val original = baselines[key] ?: readCurrentPermission(writer, target).also { baselines[key] = it }
+            val adjusted = LocalNetworkPermissionPolicy.supplement(original, writer.localBit, enabled)
+            if (!writer.chunk && original >= 0 && original and writer.internetBit == 0) return@runCatching
+            write(writer, adjusted, target)
+            val actual = readCurrentPermission(writer, target)
+            if (actual != adjusted) {
+                Logger.warn(TAG, "LAN permission verification failed: id=$target, expected=$adjusted, actual=$actual")
+            } else {
+                Logger.info(TAG, "LAN permission refreshed: id=$target, original=$original, effective=$actual, enabled=$enabled")
+            }
+        }.onFailure { Logger.warn(TAG, "Could not refresh LAN permission: ${it.cause?.message ?: it.message}") }
+    }
+
+    private fun permissionStatus(): Bundle = Bundle().apply {
+        putBoolean("running", running)
+        putBoolean("enabled", enabled)
+        putBoolean("storageFailed", settingStore.storageFailed)
+        putBoolean("backend", backend != null)
+        putBoolean("writer", activeWriter != null)
+        putBoolean("handler", writeHandler != null)
+        val writer = activeWriter
+        if (writer != null && writeHandler != null && backend != null && systemUiUid >= 0) {
             runCatching {
-                val key = baselineKey(writer, target)
-                val original = baselines[key] ?: readCurrentPermission(writer, target).also { baselines[key] = it }
-                val adjusted = LocalNetworkPermissionPolicy.supplement(original, writer.localBit, enabled)
-                if (!writer.chunk && original >= 0 && original and writer.internetBit == 0) return@runCatching
-                write(writer, adjusted, target)
+                val target = LocalNetworkPermissionPolicy.permissionId(systemUiUid, !writer.chunk)
                 val actual = readCurrentPermission(writer, target)
-                if (actual != adjusted) {
-                    Logger.warn(TAG, "LAN permission verification failed: id=$target, expected=$adjusted, actual=$actual")
-                } else {
-                    Logger.info(TAG, "LAN permission refreshed: id=$target, original=$original, effective=$actual, enabled=$enabled")
-                }
-            }.onFailure { Logger.warn(TAG, "Could not refresh LAN permission: ${it.cause?.message ?: it.message}") }
+                val granted = actual >= 0 && actual and writer.localBit != 0
+                putBoolean("granted", granted)
+                putBoolean("verified", if (enabled) granted else baselines[baselineKey(writer, target)] == actual)
+            }.onFailure { putBoolean("readbackFailed", true) }
         }
     }
 
