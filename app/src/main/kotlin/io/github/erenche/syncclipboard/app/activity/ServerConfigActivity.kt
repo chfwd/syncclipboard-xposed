@@ -407,8 +407,9 @@ private fun ServerEditPage(
     fun buildServerConfig() = ServerConfig(
         type = serverType,
         name = name.ifBlank { null },
-        url = url,
-        username = username,
+        // 粘贴的地址常带换行或空格，保存前去掉，否则连接直接失败。
+        url = url.trim(),
+        username = username.trim(),
         password = password,
         region = if (serverType == ServerType.s3 && region.isNotBlank()) region else null,
         bucketName = if (serverType == ServerType.s3) bucketName else null,
