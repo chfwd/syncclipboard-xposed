@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Bundle
 import android.os.PowerManager
+import io.github.erenche.syncclipboard.bridge.BridgeSecurity
 import io.github.erenche.syncclipboard.bridge.BridgeKeys
 import io.github.erenche.syncclipboard.bridge.SyncClipboardBridge
 import io.github.erenche.syncclipboard.common.PackageNames
@@ -20,6 +21,8 @@ import io.github.erenche.syncclipboard.common.model.HistorySyncStatus
 import io.github.erenche.syncclipboard.common.model.ProfileDto
 import io.github.erenche.syncclipboard.common.model.ServerConfig
 import io.github.erenche.syncclipboard.common.model.ServerType
+import io.github.erenche.syncclipboard.common.model.activeServer
+import io.github.erenche.syncclipboard.common.model.serverStorageKey
 import io.github.erenche.syncclipboard.common.util.HashUtils
 import io.github.erenche.syncclipboard.common.util.Logger
 import io.github.erenche.syncclipboard.common.util.VerificationCodeExtractor
@@ -37,7 +40,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
@@ -48,6 +51,8 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withTimeout
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 
@@ -90,10 +95,14 @@ class SyncEngine private constructor() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private var config: AppConfig = DEFAULT_APP_CONFIG
-    private var apiClient: SyncClipboardApi? = null
+    @Volatile private var config: AppConfig = DEFAULT_APP_CONFIG
+    private data class ClientSession(val serverKey: String, val client: SyncClipboardApi)
+    @Volatile private var clientSession: ClientSession? = null
+    private fun sessionFor(serverKey: String = config.serverStorageKey()): ClientSession? =
+        clientSession?.takeIf { it.serverKey == serverKey }
+    private val apiClient: SyncClipboardApi? get() = sessionFor()?.client
     private var appContext: Context? = null
-    private var historyService: HistoryService? = null
+    private val historyServices = mutableMapOf<String, HistoryService>()
 
     /** 验证码清理任务：hash → 延迟 Job。到期时间另存 SharedPreferences，热重载后可恢复。 */
     private val verificationCleanupJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
@@ -105,11 +114,9 @@ class SyncEngine private constructor() {
     /** 历史服务懒加载：首次真正用到时才初始化（Room DB、目录），
      *  enableHistorySync=false 的用户不产生任何开销 */
     @Synchronized
-    private fun getHistoryService(): HistoryService? {
-        if (historyService == null) {
-            appContext?.let { historyService = HistoryService(it) }
-        }
-        return historyService
+    private fun getHistoryService(serverKey: String = config.serverStorageKey()): HistoryService? {
+        val context = appContext ?: return null
+        return historyServices.getOrPut(serverKey) { HistoryService(context, serverKey) }
     }
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
 
@@ -121,7 +128,8 @@ class SyncEngine private constructor() {
     var isSignalRConnected: Boolean = false
         private set
     /** 历史推送事件通道：串行化处理，避免批量推送时协程堆积 */
-    private val historyPushChannel = Channel<HistoryRecordDto>(Channel.UNLIMITED)
+    private data class HistoryPush(val serverKey: String, val record: HistoryRecordDto)
+    private val historyPushChannel = Channel<HistoryPush>(Channel.UNLIMITED)
     /** 历史推送通道消费者协程 */
     private var historyPushConsumer: Job? = null
 
@@ -248,10 +256,12 @@ class SyncEngine private constructor() {
         }
 
         config = Prefs.loadConfig(context)
+        scope.launch { Prefs.migrateSensitiveValues(context) }
         // 加载持久化的历史同步游标（增量同步用）
         lastSyncTime = Prefs.loadHistoryLastSyncTime(context)
         // 引擎数据统一目录 filesDir/SyncClipboard/（历史库/归档/下载暂存）
         EngineStorage.ensureDirs(context)
+        EngineStorage.serverRoot(context, config.serverStorageKey())
         // 加载持久化的远程内容状态（SystemUI 重启后避免重复下载/重复历史）
         lastRemoteHash = Prefs.loadLastRemoteHash(context)
         lastRemoteFilePath = Prefs.loadLastRemoteFilePath(context)
@@ -329,7 +339,7 @@ class SyncEngine private constructor() {
                         val success = try {
                             fetchRemoteClipboard()
                         } catch (e: Exception) {
-                            Logger.error(TAG, "Remote fetch error", e)
+                            Logger.error(TAG, "Remote fetch error")
                             false
                         }
                     if (success) {
@@ -351,7 +361,7 @@ class SyncEngine private constructor() {
                                             syncHistory(force = false)
                                             lastHistorySyncAt = android.os.SystemClock.elapsedRealtime()
                                         } catch (e: Exception) {
-                                            Logger.warn(TAG, "Polling history sync error: ${e.message}")
+                                            Logger.warn(TAG, "Polling history sync error: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                                         }
                                     }
                                 }
@@ -452,7 +462,7 @@ class SyncEngine private constructor() {
             powerStateReceiver = receiver
             Logger.info(TAG, "Power state monitor registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register power state monitor: ${e.message}")
+            Logger.warn(TAG, "Failed to register power state monitor: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -535,7 +545,7 @@ class SyncEngine private constructor() {
                         Logger.info(TAG, "Catch-up fetch after resume")
                         fetchRemoteClipboard(force = true)
                     } catch (e: Exception) {
-                        Logger.warn(TAG, "Catch-up fetch after resume failed: ${e.message}")
+                        Logger.warn(TAG, "Catch-up fetch after resume failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     }
                 }
             }
@@ -577,7 +587,7 @@ class SyncEngine private constructor() {
             handleNetworkChange(cm) // 初始化当前状态
             Logger.info(TAG, "Network monitor registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register network monitor: ${e.message}")
+            Logger.warn(TAG, "Failed to register network monitor: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -629,7 +639,7 @@ class SyncEngine private constructor() {
             uninstallReceiver = receiver
             Logger.info(TAG, "Uninstall monitor registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register uninstall monitor: ${e.message}")
+            Logger.warn(TAG, "Failed to register uninstall monitor: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -640,13 +650,7 @@ class SyncEngine private constructor() {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
                     if (intent.action != BridgeKeys.ACTION_NOTIF_CAPTURE) return
-                    // 信任校验：发送方应为 system_server(1000)，或本模块进程（SystemUI/本 App）——
-                    // 实测 system_server 发出的广播在部分 ROM 上到达时被归属为 SystemUI 的 uid，不能只放行 1000。
-                    val uid = android.os.Binder.getCallingUid()
-                    if (uid != android.os.Process.SYSTEM_UID) {
-                        val pkgs = context.packageManager.getPackagesForUid(uid).orEmpty()
-                        if (PackageNames.SYSTEM_UI !in pkgs && PackageNames.APPLICATION !in pkgs) return
-                    }
+                    if (!BridgeSecurity.isTrustedSender(context, this, BridgeSecurity.PERMISSION_SYSTEM_EVENT)) return
                     val body = intent.getStringExtra(BridgeKeys.EXTRA_NOTIF_BODY) ?: return
                     val pkg = intent.getStringExtra(BridgeKeys.EXTRA_NOTIF_PKG) ?: "?"
                     handleCapturedBody(pkg, body)
@@ -655,12 +659,13 @@ class SyncEngine private constructor() {
             androidx.core.content.ContextCompat.registerReceiver(
                 ctx, receiver,
                 IntentFilter(BridgeKeys.ACTION_NOTIF_CAPTURE),
+                BridgeSecurity.PERMISSION_SYSTEM_EVENT, null,
                 androidx.core.content.ContextCompat.RECEIVER_EXPORTED
             )
             notifCaptureReceiver = receiver
             Logger.info(TAG, "Notif-capture monitor registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register notif capture monitor: ${e.message}")
+            Logger.warn(TAG, "Failed to register notif capture monitor: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -692,7 +697,7 @@ class SyncEngine private constructor() {
             cm.addPrimaryClipChangedListener(clipChangedListener)
             Logger.info(TAG, "OnPrimaryClipChangedListener registered")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to register clip listener: ${e.message}")
+            Logger.warn(TAG, "Failed to register clip listener: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -702,9 +707,10 @@ class SyncEngine private constructor() {
             as? android.content.ClipboardManager ?: return@OnPrimaryClipChangedListener
         // 主线程仅取 ClipData 快照；provider 查询（跨进程 Binder）转后台执行
         val clip = cm.primaryClip ?: return@OnPrimaryClipChangedListener
+        val serverKey = config.serverStorageKey()
         scope.launch {
             val content = extractFromClip(ctx, clip) ?: return@launch
-            onLocalClipboardChanged(content)
+            onLocalClipboardChanged(content, serverKey = serverKey)
         }
     }
 
@@ -756,24 +762,27 @@ class SyncEngine private constructor() {
      * 确保旧代模块代码不再持有任何系统引用（ClipboardManager/广播/网络回调），
      * 新代模块可通过 [initialize] 干净重建。
      */
+    @Synchronized
     fun shutdown() {
         if (appContext == null) return
         stop()
         signalRClient?.dispose()
         signalRClient = null
+        clientSession?.client?.close()
+        clientSession = null
         isSignalRConnected = false
         historyPushConsumer?.cancel()
         historyPushConsumer = null
         historyDeleteFlushJob?.cancel()
         historyDeleteFlushJob = null
         // 取消轮询循环与所有后台协程（含 delay 中的等待）
-        scope.coroutineContext[Job]?.cancelChildren()
+        scope.cancel()
         verificationCleanupJobs.clear()
         // 拆除 IPC 路由：反注册 receiver，防止新旧两代并存双重处理
         SyncClipboardBridge.teardown()
         // 关闭历史数据库连接（旧代 Room 实例随类加载器一起废弃）
-        historyService?.let { _ -> AppDatabase.closeInstance() }
-        historyService = null
+        AppDatabase.closeInstance()
+        historyServices.clear()
         appContext = null
         synchronized(Companion) { instance = null }
         Logger.info(TAG, "SyncEngine shutdown (hot reload)")
@@ -866,7 +875,9 @@ class SyncEngine private constructor() {
      *
      * @param force 是否强制处理（跳过去重），用于手动上传
      */
-    fun onLocalClipboardChanged(content: ClipboardContent, force: Boolean = false) {
+    fun onLocalClipboardChanged(
+        content: ClipboardContent, force: Boolean = false, serverKey: String = config.serverStorageKey()
+    ) {
         // 仅在已初始化的进程（SystemUI）中处理，App 进程的未初始化实例直接跳过
         if (appContext == null) return
 
@@ -876,33 +887,36 @@ class SyncEngine private constructor() {
             else HashUtils.sha256(content.text)
 
         synchronized(localDedupLock) {
-            if (!force && hash.equals(lastLocalHash, ignoreCase = true)) return
-            lastLocalHash = hash
+            if (serverKey == config.serverStorageKey()) {
+                if (!force && hash.equals(lastLocalHash, ignoreCase = true)) return
+                lastLocalHash = hash
+            }
         }
 
         scope.launch {
             try {
                 Logger.debug(TAG, "Local clipboard changed: type=${content.type}, hash=${hash.take(12)}, textLength=${content.text.length}, hasData=${content.hasData}")
-                getHistoryService()?.addLocalContent(content)
+                getHistoryService(serverKey)?.addLocalContent(content)
                 notifyContentChanged()
                 if (config.enableAutoSync && config.enableBackgroundUpload) {
-                    val uploaded = uploadContent(content)
+                    val uploaded = uploadContent(content, serverKey = serverKey)
                     if (!uploaded) {
                         // 上传失败：入队重试队列，网络恢复后自动重放
                         val ctx = appContext
                         if (ctx != null) {
-                            UploadQueue.enqueue(ctx, content)
+                            UploadQueue.enqueue(ctx, serverKey, content)
                             flushUploadQueue(ctx)
                         }
                     }
                     // 历史同步改为手动触发，上传后不再自动 syncHistory
                 }
             } catch (e: Exception) {
-                Logger.error(TAG, "Error handling local clipboard change", e)
+                Logger.error(TAG, "Error handling local clipboard change")
             }
         }
     }
 
+    @Synchronized
     fun onConfigChanged(newConfig: AppConfig) {
         // 幂等去重：app 启动/页面进入会多次推送相同配置，直接跳过重建，
         // 避免 SignalR 客户端被反复 dispose/重建导致连接竞态与重复日志
@@ -913,15 +927,22 @@ class SyncEngine private constructor() {
             Logger.debug(TAG, "Config unchanged, skipping client rebuild")
             return
         }
-        val oldServers = config.servers
-        val oldActiveIdx = config.activeServerIndex
+        val oldConfig = config
+        val serverChanged = oldConfig.serverStorageKey() != newConfig.serverStorageKey()
+        val httpChanged = ClientUpdatePolicy.httpChanged(oldConfig, newConfig)
+        val signalRChanged = ClientUpdatePolicy.signalRChanged(oldConfig, newConfig)
         val cleanupWasEnabled = config.enableVerificationCodeAutoCleanup
+        if (serverChanged) {
+            cancelVerificationCleanupTasks(clearPersisted = false)
+            historyDeleteFlushJob?.cancel()
+            historyDeleteFlushJob = null
+        }
         config = newConfig
         if (cleanupWasEnabled && !newConfig.enableVerificationCodeAutoCleanup) {
             cancelVerificationCleanupTasks(clearPersisted = true)
         }
-        rebuildApiClient()  // 内部会重建 SignalR 客户端
-        flushPendingHistoryDeletes()
+        if (httpChanged) rebuildApiClient()
+        else if (signalRChanged) rebuildSignalRClient(config.activeServer())
         // 重新评估省电模式：用户可能在省电模式已开启时才打开“省电停止”开关
         reevaluatePowerSaveState()
         // 配置变更后重启 SignalR 连接（自动同步开启且未被息屏/省电暂停时）
@@ -933,12 +954,12 @@ class SyncEngine private constructor() {
         Logger.logLevel = newConfig.logLevel
         Logger.maxBufferSize = newConfig.logBufferSize
         // 切换服务器时重置历史同步游标，触发全量同步
-        val serverChanged = oldServers != newConfig.servers || oldActiveIdx != newConfig.activeServerIndex
         if (serverChanged) {
             lastSyncTime = 0L
             lastRemoteHash = null
             lastRemoteProfile = null
             lastRemoteFilePath = null
+            synchronized(localDedupLock) { lastLocalHash = null }
             appContext?.let {
                 Prefs.resetHistoryLastSyncTime(it)
                 Prefs.saveLastRemoteHash(it, null)
@@ -946,7 +967,10 @@ class SyncEngine private constructor() {
                 Prefs.saveLastRemoteFilePath(it, null)
             }
             Logger.info(TAG, "Server changed, history cursor and remote content cache reset")
+            restoreVerificationCleanupTasks()
         }
+        flushPendingHistoryDeletes()
+        appContext?.let { flushUploadQueue(it) }
         // 总开关关闭时：立即置为未连接并停止轮询；断开 SignalR 并清除
         // 息屏/省电/移动网络暂停标志，避免状态残留导致亮屏后触发无意义的 resume 流程
         if (!newConfig.enableAutoSync) {
@@ -965,7 +989,7 @@ class SyncEngine private constructor() {
         }
         // 配置变更后重新评估移动网络暂停状态（用户可能刚开启/关闭了移动网络断开）
         reevaluateMobileDataState()
-        Logger.info(TAG, "Config changed, client rebuilt, logging=${newConfig.enableLogging}, autoSync=${newConfig.enableAutoSync}, pollingInterval=${newConfig.pollingIntervalSec}s, signalRPush=${newConfig.enableSignalRPush}")
+        Logger.info(TAG, "Config changed, httpRebuilt=$httpChanged, pushRebuilt=$signalRChanged, autoSync=${newConfig.enableAutoSync}")
     }
 
     fun forceSync() {
@@ -987,7 +1011,7 @@ class SyncEngine private constructor() {
                     message = "Sync failed"
                 }
             } catch (e: Exception) {
-                Logger.error(TAG, "Force sync failed", e)
+                Logger.error(TAG, "Force sync failed")
                 message = "Sync error: ${e.message}"
             }
             notifyActionResult("sync", success, message)
@@ -1013,8 +1037,9 @@ class SyncEngine private constructor() {
      * @param fullSync true 时强制全量同步（重置游标）；仅在首次启动/配置切换等场景使用。
      */
     private suspend fun syncHistory(force: Boolean = false, fullSync: Boolean = false): SyncHistoryResult {
-        val client = apiClient ?: return SyncHistoryResult(false, 0, "API client is null")
-        val hs = getHistoryService() ?: return SyncHistoryResult(false, 0, "History service is null")
+        val serverKey = config.serverStorageKey()
+        val client = sessionFor(serverKey)?.client ?: return SyncHistoryResult(false, 0, "API client is null")
+        val hs = getHistoryService(serverKey) ?: return SyncHistoryResult(false, 0, "History service is null")
         // 互斥锁：防止轮询、FORCE_SYNC_HISTORY、剪贴板变化触发并发 syncHistory
         if (force || fullSync) {
             // 手动触发/全量：等待正在进行的同步完成（最多 15s，防止轮询同步卡住时
@@ -1058,7 +1083,7 @@ class SyncEngine private constructor() {
                     }
                 }
             } catch (e: Exception) {
-                Logger.warn(TAG, "syncHistory: getServerTime failed (non-fatal): ${e.message}")
+                Logger.warn(TAG, "syncHistory: getServerTime failed (non-fatal): ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             }
 
             // 1. 分页拉取服务器记录（与 RN fetchRemoteRecords 一致）
@@ -1068,6 +1093,7 @@ class SyncEngine private constructor() {
             val maxPages = 1000 // 安全上限
             while (page <= maxPages) {
                 val batch = client.queryHistoryRecords(page, modifiedAfter, 15)
+                check(client === apiClient) { "Server changed during history synchronization" }
                 Logger.info(TAG, "syncHistory: page=$page, batch size=${batch.size}")
                 if (batch.isEmpty()) break
                 // 按 hash 去重（同一 hash 可能跨页出现，保留首次出现版本）
@@ -1136,6 +1162,7 @@ class SyncEngine private constructor() {
             val uploadFailed = postResults.count { it == PostOutcome.FAILED }
             Logger.info(TAG, "syncHistory: POST localOnly=${localOnlyItems.size}, success=$uploadSuccess, conflict=$uploadConflict, failed=$uploadFailed")
 
+            check(client === apiClient) { "Server changed during history synchronization" }
             // 6. 保存 lastSyncTime 游标（与 RN 一致，在整个同步流程完成后保存）
             lastSyncTime = System.currentTimeMillis()
             appContext?.let { Prefs.saveHistoryLastSyncTime(it, lastSyncTime) }
@@ -1145,7 +1172,7 @@ class SyncEngine private constructor() {
             val activeFetched = allRecords.count { it.isDeleted != true }
             return SyncHistoryResult(true, activeFetched, null)
         } catch (e: Exception) {
-            Logger.warn(TAG, "syncHistory failed: ${e.message}", e)
+            Logger.warn(TAG, "syncHistory failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             return SyncHistoryResult(false, 0, e.message ?: "Unknown error")
         } finally {
             // 统一落盘一次（批量模式期间的所有变更）
@@ -1235,7 +1262,7 @@ class SyncEngine private constructor() {
                 PatchOutcome.SUCCESS
             }
         } catch (e: Exception) {
-            Logger.warn(TAG, "syncHistory: PATCH failed for ${item.profileHash}: ${e.message}")
+            Logger.warn(TAG, "syncHistory: PATCH failed for ${item.profileHash}: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             PatchOutcome.FAILED
         }
     }
@@ -1267,7 +1294,7 @@ class SyncEngine private constructor() {
                 PostOutcome.FAILED
             }
         } catch (e: Exception) {
-            Logger.warn(TAG, "syncHistory: POST failed for ${item.profileHash}: ${e.message}")
+            Logger.warn(TAG, "syncHistory: POST failed for ${item.profileHash}: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             PostOutcome.FAILED
         }
     }
@@ -1280,6 +1307,7 @@ class SyncEngine private constructor() {
     )
 
     fun forceUpload() {
+        val serverKey = config.serverStorageKey()
         scope.launch {
             var success = false
             var message: String? = null
@@ -1308,13 +1336,13 @@ class SyncEngine private constructor() {
                 // 手动上传绕过 autoSync/bgUpload 开关，直接上传
                 val hash = content.profileHash ?: HashUtils.sha256(content.text)
                 lastLocalHash = hash
-                getHistoryService()?.addLocalContent(content)
+                getHistoryService(serverKey)?.addLocalContent(content)
                 notifyContentChanged()
-                success = uploadContent(content)
+                success = uploadContent(content, serverKey = serverKey)
                 // 历史同步改为手动触发，上传后不再自动 syncHistory
                 message = if (success) "Upload OK" else "Upload failed"
             } catch (e: Exception) {
-                Logger.error(TAG, "Force upload failed", e)
+                Logger.error(TAG, "Force upload failed")
                 message = "Upload error: ${e.message}"
             }
             notifyActionResult("upload", success, message)
@@ -1327,7 +1355,9 @@ class SyncEngine private constructor() {
      */
     fun uploadText(text: String, verificationCode: Boolean = false) {
         if (appContext == null || text.isBlank()) return
+        val serverKey = config.serverStorageKey()
         scope.launch {
+            if (config.serverStorageKey() != serverKey) return@launch
             try {
                 // 先设置 lastLocalHash，阻止 clipChangedListener 在 setPrimaryClip 后把相同
                 // 内容当作"新剪贴板变化"再次上传（clipChangedListener 在主线程异步回调，若
@@ -1350,7 +1380,7 @@ class SyncEngine private constructor() {
                         )
                         Logger.info(TAG, "uploadText: copied to clipboard")
                     } catch (e: Exception) {
-                        Logger.warn(TAG, "uploadText: clipboard copy failed: ${e.message}")
+                        Logger.warn(TAG, "uploadText: clipboard copy failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     }
                 }
                 // 不再依赖 60 秒后的剪贴板清理来复位去重标记；仅保留短时窗口抑制本次 setPrimaryClip 的回声。
@@ -1359,8 +1389,8 @@ class SyncEngine private constructor() {
                 if (alreadyRemote) {
                     Logger.info(TAG, "uploadText: skipped upload (already remote)")
                     if (verificationCode && config.enableVerificationCodeAutoCleanup) {
-                        ensureVerificationHistory(text, profileHash)
-                        scheduleVerificationCleanup(profileHash)
+                        ensureVerificationHistory(text, profileHash, serverKey)
+                        scheduleVerificationCleanup(profileHash, serverKey = serverKey)
                     }
                     return@launch
                 }
@@ -1372,23 +1402,23 @@ class SyncEngine private constructor() {
                     profileHash = profileHash,
                     timestamp = System.currentTimeMillis()
                 )
-                getHistoryService()?.addLocalContent(content)
+                getHistoryService(serverKey)?.addLocalContent(content)
                 notifyContentChanged()
-                val ok = uploadContent(content)
+                val ok = uploadContent(content, serverKey = serverKey)
                 if (ok && verificationCode && config.enableVerificationCodeAutoCleanup) {
-                    scheduleVerificationCleanup(profileHash)
+                    scheduleVerificationCleanup(profileHash, serverKey = serverKey)
                 }
                 // 历史同步改为手动触发，上传后不再自动 syncHistory
                 Logger.info(TAG, "uploadText: ok=$ok hash=${profileHash.take(12)}, verification=$verificationCode")
             } catch (e: Exception) {
-                Logger.error(TAG, "uploadText failed", e)
+                Logger.error(TAG, "uploadText failed")
             }
         }
     }
 
     /** 远端内容已存在但本地没有对应历史时，补建本地记录以便定时删除时带版本同步服务器。 */
-    private fun ensureVerificationHistory(text: String, profileHash: String) {
-        val hs = getHistoryService() ?: return
+    private fun ensureVerificationHistory(text: String, profileHash: String, serverKey: String) {
+        val hs = getHistoryService(serverKey) ?: return
         val existing = hs.getItemByProfileHash(profileHash)
         if (existing == null || existing.isDeleted) {
             hs.addLocalContent(ClipboardContent(
@@ -1420,21 +1450,23 @@ class SyncEngine private constructor() {
     private fun scheduleVerificationCleanup(
         profileHash: String,
         dueAt: Long = System.currentTimeMillis() + VERIFICATION_CLEANUP_DELAY_MS,
-        persist: Boolean = true
+        persist: Boolean = true,
+        serverKey: String = config.serverStorageKey()
     ) {
-        if (!config.enableVerificationCodeAutoCleanup) return
+        if (!config.enableVerificationCodeAutoCleanup || serverKey != config.serverStorageKey()) return
         val key = profileHash.lowercase()
-        if (persist) saveVerificationCleanupTask(key, dueAt)
+        val jobKey = "$serverKey:$key"
+        if (persist) saveVerificationCleanupTask(key, dueAt, serverKey)
 
-        verificationCleanupJobs.remove(key)?.cancel()
-        verificationCleanupJobs[key] = scope.launch {
+        verificationCleanupJobs.remove(jobKey)?.cancel()
+        verificationCleanupJobs[jobKey] = scope.launch {
             val waitMs = (dueAt - System.currentTimeMillis()).coerceAtLeast(0L)
             delay(waitMs)
-            while (isActive) {
+            while (isActive && serverKey == config.serverStorageKey()) {
                 try {
-                    if (performVerificationCleanup(key)) {
-                        removeVerificationCleanupTask(key)
-                        verificationCleanupJobs.remove(key)
+                    if (performVerificationCleanup(key, serverKey)) {
+                        removeVerificationCleanupTask(key, serverKey)
+                        verificationCleanupJobs.remove(jobKey)
                         break
                     }
                     // 服务端 PATCH 失败时保留持久化任务，直到网络恢复或请求成功。
@@ -1443,7 +1475,7 @@ class SyncEngine private constructor() {
                     throw e
                 } catch (e: Exception) {
                     // 本地数据库暂不可用时保留持久化任务，并在当前进程内继续重试。
-                    Logger.warn(TAG, "Verification cleanup failed for ${key.take(12)}: ${e.message}")
+                    Logger.warn(TAG, "Verification cleanup failed for ${key.take(12)}: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     delay(30_000L)
                 }
             }
@@ -1462,12 +1494,13 @@ class SyncEngine private constructor() {
         }
     }
 
-    private suspend fun performVerificationCleanup(profileHash: String): Boolean {
-        val tombstone = getHistoryService()?.deleteByProfileHash(profileHash)
+    private suspend fun performVerificationCleanup(profileHash: String, serverKey: String): Boolean {
+        if (serverKey != config.serverStorageKey()) return false
+        val tombstone = getHistoryService(serverKey)?.deleteByProfileHash(profileHash)
         if (tombstone != null) {
             notifyContentChanged()
             // 删除操作不受历史同步开关影响；失败会留下 NeedSync 墓碑，任务保留并重试。
-            val outcome = pushSingleHistoryUpdate(tombstone.id)
+            val outcome = pushSingleHistoryUpdate(tombstone.id, serverKey)
             if (outcome == PatchOutcome.FAILED) {
                 Logger.warn(TAG, "Verification history cleanup pending: hash=${profileHash.take(12)}")
                 return false
@@ -1479,10 +1512,10 @@ class SyncEngine private constructor() {
         return true
     }
 
-    private fun loadVerificationCleanupTasks(): Map<String, Long> {
+    private fun loadVerificationCleanupTasks(serverKey: String = config.serverStorageKey()): Map<String, Long> {
         val ctx = appContext ?: return emptyMap()
         val values = Prefs.getPrefs(ctx)
-            .getStringSet(PREF_KEY_VERIFICATION_CLEANUP_TASKS, emptySet())
+            .getStringSet("$PREF_KEY_VERIFICATION_CLEANUP_TASKS:$serverKey", emptySet())
             ?.toSet()
             .orEmpty()
         return buildMap {
@@ -1496,28 +1529,28 @@ class SyncEngine private constructor() {
         }
     }
 
-    private fun saveVerificationCleanupTask(profileHash: String, dueAt: Long) {
+    private fun saveVerificationCleanupTask(profileHash: String, dueAt: Long, serverKey: String) {
         val ctx = appContext ?: return
         synchronized(verificationCleanupPrefsLock) {
-            val tasks = loadVerificationCleanupTasks().toMutableMap()
+            val tasks = loadVerificationCleanupTasks(serverKey).toMutableMap()
             tasks[profileHash.lowercase()] = dueAt
             Prefs.getPrefs(ctx).edit()
                 .putStringSet(
-                    PREF_KEY_VERIFICATION_CLEANUP_TASKS,
+                    "$PREF_KEY_VERIFICATION_CLEANUP_TASKS:$serverKey",
                     tasks.mapTo(mutableSetOf()) { (hash, time) -> "$hash:$time" }
                 )
                 .apply()
         }
     }
 
-    private fun removeVerificationCleanupTask(profileHash: String) {
+    private fun removeVerificationCleanupTask(profileHash: String, serverKey: String) {
         val ctx = appContext ?: return
         synchronized(verificationCleanupPrefsLock) {
-            val tasks = loadVerificationCleanupTasks().toMutableMap()
+            val tasks = loadVerificationCleanupTasks(serverKey).toMutableMap()
             tasks.remove(profileHash.lowercase())
             Prefs.getPrefs(ctx).edit()
                 .putStringSet(
-                    PREF_KEY_VERIFICATION_CLEANUP_TASKS,
+                    "$PREF_KEY_VERIFICATION_CLEANUP_TASKS:$serverKey",
                     tasks.mapTo(mutableSetOf()) { (hash, time) -> "$hash:$time" }
                 )
                 .apply()
@@ -1529,7 +1562,12 @@ class SyncEngine private constructor() {
         verificationCleanupJobs.clear()
         if (clearPersisted) {
             appContext?.let { ctx ->
-                Prefs.getPrefs(ctx).edit().remove(PREF_KEY_VERIFICATION_CLEANUP_TASKS).apply()
+                val prefs = Prefs.getPrefs(ctx)
+                val editor = prefs.edit()
+                prefs.all.keys.filter {
+                    it == PREF_KEY_VERIFICATION_CLEANUP_TASKS || it.startsWith("$PREF_KEY_VERIFICATION_CLEANUP_TASKS:")
+                }.forEach { editor.remove(it) }
+                editor.apply()
             }
         }
     }
@@ -1541,7 +1579,10 @@ class SyncEngine private constructor() {
      * 更新远端缓存（lastRemoteHash/profile），避免轮询把刚上传的内容
      * 误判为"远端新内容"而重复下载。上传本身已不经过引擎（不再依赖 SystemUI 进程存续）。
      */
-    fun registerUploadedContent(fileUri: String, fileName: String, isImage: Boolean, fileSize: Long) {
+    fun registerUploadedContent(
+        fileUri: String, fileName: String, isImage: Boolean, fileSize: Long,
+        serverKey: String = config.serverStorageKey()
+    ) {
         if (appContext == null || fileUri.isBlank() || fileName.isBlank()) return
         scope.launch {
             try {
@@ -1553,7 +1594,7 @@ class SyncEngine private constructor() {
                     if (input != null) HashUtils.computeFileHash(fileName, input)
                     else HashUtils.sha256(fileName)
                 } catch (e: Exception) {
-                    Logger.warn(TAG, "registerUploadedContent: hash fallback: ${e.message}")
+                    Logger.warn(TAG, "registerUploadedContent: hash fallback: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     HashUtils.sha256(fileName)
                 }
                 val content = ClipboardContent(
@@ -1566,8 +1607,9 @@ class SyncEngine private constructor() {
                     profileHash = hash,
                     timestamp = System.currentTimeMillis()
                 )
-                getHistoryService()?.addLocalContent(content)
-                getHistoryService()?.enforceDiskLimit()
+                getHistoryService(serverKey)?.addLocalContent(content)
+                getHistoryService(serverKey)?.enforceDiskLimit()
+                if (serverKey != config.serverStorageKey()) return@launch
                 lastRemoteHash = hash
                 Prefs.saveLastRemoteHash(ctx, hash)
                 lastRemoteProfile = ProfileDto(
@@ -1582,7 +1624,7 @@ class SyncEngine private constructor() {
                 notifyContentChanged()
                 Logger.info(TAG, "registerUploadedContent: hash=${hash.take(12)}, name=$fileName")
             } catch (e: Exception) {
-                Logger.error(TAG, "registerUploadedContent failed", e)
+                Logger.error(TAG, "registerUploadedContent failed")
             }
         }
     }
@@ -1595,14 +1637,17 @@ class SyncEngine private constructor() {
         scope.launch {
             try {
                 cancelVerificationCleanupTasks(clearPersisted = true)
-                getHistoryService()?.clearAll()
                 appContext?.let { ctx ->
                     // 历史归档文件目录（history_files）应一并清空：clearAll 仅按 DB 活跃记录的 fileUri
                     // 逐个删除，可能会因父目录路径比对失败或软删除残留而漏删，这里整体清空目录内容。
-                    EngineStorage.historyDir(ctx).let { dir ->
-                        if (dir.exists()) dir.listFiles()?.forEach { it.deleteRecursively() }
+                    for (key in EngineStorage.serverKeys(ctx)) {
+                        getHistoryService(key)?.clearAll()
+                        EngineStorage.historyDir(ctx, key).let { dir ->
+                            if (dir.exists()) dir.listFiles()?.forEach { it.deleteRecursively() }
+                        }
+                        EngineStorage.downloadsDir(ctx, key).let { if (it.exists()) it.deleteRecursively() }
                     }
-                    EngineStorage.downloadsDir(ctx).let { if (it.exists()) it.deleteRecursively() }
+                    UploadQueue.clear(ctx)
                     EngineStorage.uploadTempDir(ctx).listFiles()?.forEach { it.delete() }
                     // 目录集中化之前的孤儿数据（不存在则忽略）
                     EngineStorage.cleanupLegacy(ctx)
@@ -1618,7 +1663,7 @@ class SyncEngine private constructor() {
                 notifyContentChanged()
                 Logger.info(TAG, "clearEngineData: engine local data cleared")
             } catch (e: Exception) {
-                Logger.warn(TAG, "clearEngineData failed: ${e.message}")
+                Logger.warn(TAG, "clearEngineData failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             }
         }
     }
@@ -1652,6 +1697,7 @@ class SyncEngine private constructor() {
             }
 
             val fetched = client.getClipboard()
+            check(client === apiClient) { "Server changed during fetch" }
             if (fetched == null) {
                 setConnected(false)
                 Logger.warn(TAG, "fetchRemoteClipboard: getClipboard returned null")
@@ -1672,7 +1718,7 @@ class SyncEngine private constructor() {
             throw e
         } catch (e: Exception) {
             setConnected(false)
-            Logger.warn(TAG, "Remote fetch error", e)
+            Logger.warn(TAG, "Remote fetch error")
             return false
         } finally {
             isFetching = false
@@ -1687,7 +1733,7 @@ class SyncEngine private constructor() {
                     try {
                         fetchRemoteClipboard(force = true)
                     } catch (e: Exception) {
-                        Logger.warn(TAG, "Queued force fetch failed", e)
+                        Logger.warn(TAG, "Queued force fetch failed")
                     }
                 }
             }
@@ -1748,7 +1794,9 @@ class SyncEngine private constructor() {
     private fun restoreRemoteFilePath(profile: ProfileDto): Boolean {
         val name = profile.dataName ?: return false
         val ctx = appContext ?: return false
-        val path = java.io.File(EngineStorage.downloadsDir(ctx), name).absolutePath
+        val path = runCatching {
+            EngineStorage.resolveDownloadFile(EngineStorage.downloadsDir(ctx, config.serverStorageKey()), name).path
+        }.getOrNull() ?: return false
         val file = java.io.File(path)
         if (file.exists() && file.length() > 0) {
             lastRemoteFilePath = path
@@ -1762,21 +1810,21 @@ class SyncEngine private constructor() {
     /** 先广播 profile 供 app 立即刷新（app 自行下载预览文件），
      *  文件下载/历史记录/自动保存放到后台协程执行，避免大文件下载阻塞 fetch 返回与轮询。 */
     private fun notifyAndApplyAsync(profile: ProfileDto) {
+        val serverKey = config.serverStorageKey()
         lastRemoteProfile = profile
         appContext?.let { Prefs.saveLastRemoteProfile(it, profile) }
         notifyContentChanged()
         scope.launch {
             try {
-                downloadAndApplyContent(profile)
+                downloadAndApplyContent(profile, serverKey)
             } catch (e: Exception) {
-                Logger.error(TAG, "Background download and apply failed", e)
+                Logger.error(TAG, "Background download and apply failed")
             }
         }
     }
 
     /** 上传失败重试队列是否正在重放（防重入） */
-    @Volatile
-    private var uploadQueueFlushing = false
+    private val uploadQueueFlushing = AtomicBoolean(false)
 
     /** 网络是否可用（用于 onAvailable 时判断"恢复"场景，避免重复触发队列重放） */
     @Volatile
@@ -1790,32 +1838,33 @@ class SyncEngine private constructor() {
     private fun flushUploadQueue(context: Context) {
         // 队列重放属于后台自动同步行为，总开关关闭时不重放（手动上传不受影响）
         if (!config.enableAutoSync) return
-        if (uploadQueueFlushing) return
-        if (UploadQueue.isEmpty(context)) return
-        uploadQueueFlushing = true
+        val serverKey = config.serverStorageKey()
+        if (runCatching { UploadQueue.isEmpty(context, serverKey) }.getOrDefault(true)) return
+        if (!uploadQueueFlushing.compareAndSet(false, true)) return
         scope.launch {
             try {
-                while (isActive) {
-                    val item = UploadQueue.peek(context) ?: break
+                while (isActive && config.enableAutoSync && config.serverStorageKey() == serverKey) {
+                    val item = UploadQueue.peek(context, serverKey) ?: break
                     val key = UploadQueue.contentKey(item.content)
-                    val ok = uploadContent(item.content)
+                    val ok = uploadContent(item.content, serverKey = serverKey)
                     if (ok) {
-                        UploadQueue.remove(context, key)
+                        UploadQueue.remove(context, serverKey, key)
                     } else {
                         // 单条失败：记录重试次数，超过上限丢弃（防止死循环堆积）
-                        UploadQueue.markRetry(context, key)
+                        UploadQueue.markRetry(context, serverKey, key)
                         Logger.warn(TAG, "Upload queue flush failed (retry=${item.retryCount + 1}, key=${key.take(12)}, textLength=${item.content.text.length})")
                         if (item.retryCount >= MAX_UPLOAD_RETRY) {
                             Logger.warn(TAG, "Upload queue: dropping item after $MAX_UPLOAD_RETRY retries")
-                            UploadQueue.remove(context, key)
+                            UploadQueue.remove(context, serverKey, key)
                         }
                         break
                     }
                 }
             } catch (e: Exception) {
-                Logger.warn(TAG, "Upload queue flush error: ${e.message}")
+                Logger.warn(TAG, "Upload queue flush error: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             } finally {
-                uploadQueueFlushing = false
+                uploadQueueFlushing.set(false)
+                if (config.serverStorageKey() != serverKey) flushUploadQueue(context)
             }
         }
     }
@@ -1828,9 +1877,11 @@ class SyncEngine private constructor() {
      */
     private suspend fun uploadContent(
         content: ClipboardContent,
-        onProgress: ((Long, Long) -> Unit)? = null
+        onProgress: ((Long, Long) -> Unit)? = null,
+        serverKey: String = config.serverStorageKey()
     ): Boolean {
-        val client = apiClient ?: run {
+        if (serverKey != config.serverStorageKey()) return false
+        val client = sessionFor(serverKey)?.client ?: run {
             Logger.warn(TAG, "No API client configured, skipping upload")
             return false
         }
@@ -1853,6 +1904,7 @@ class SyncEngine private constructor() {
             }
 
             client.putContent(uploadContent, onProgress)
+            check(client === apiClient && serverKey == config.serverStorageKey()) { "Server changed during upload" }
             lastSyncTime = System.currentTimeMillis()
             // 设置 lastRemoteHash，防止轮询循环立即下载刚上传的内容
             // 使用 uploadContent（已将 content:// 转为本地路径）保证文件 hash 可读
@@ -1874,16 +1926,16 @@ class SyncEngine private constructor() {
             Logger.info(TAG, "Content uploaded successfully")
             return true
         } catch (e: Exception) {
-            Logger.error(TAG, "Upload failed", e)
+            Logger.error(TAG, "Upload failed")
             return false
         }
     }
 
     /** 清理引擎下载目录：仅保留当前文件，其余删除。
      *  历史归档副本在 history_files/ 由 HistoryService 的磁盘 LRU 管理，下载目录只做"当前文件"暂存。 */
-    private fun trimDownloadsDir(context: Context, keepName: String) {
+    private fun trimDownloadsDir(context: Context, keepName: String, serverKey: String) {
         try {
-            val dir = EngineStorage.downloadsDir(context)
+            val dir = EngineStorage.downloadsDir(context, serverKey)
             if (!dir.isDirectory) return
             dir.listFiles()?.forEach { f ->
                 if (f.isFile && f.name != keepName) f.delete()
@@ -1909,13 +1961,14 @@ class SyncEngine private constructor() {
             Logger.debug(TAG, "Copied URI to temp file: $uriString -> ${tempFile.absolutePath}")
             tempFile
         } catch (e: Exception) {
-            Logger.error(TAG, "Failed to copy URI to temp file: $uriString", e)
+            Logger.error(TAG, "Failed to copy URI to temp file: $uriString")
             null
         }
     }
 
-    private suspend fun downloadAndApplyContent(profile: ProfileDto) {
-        val client = apiClient ?: run {
+    private suspend fun downloadAndApplyContent(profile: ProfileDto, serverKey: String = config.serverStorageKey()) {
+        if (serverKey != config.serverStorageKey()) return
+        val client = sessionFor(serverKey)?.client ?: run {
             Logger.warn(TAG, "downloadAndApplyContent: apiClient is null, skipping")
             return
         }
@@ -1937,7 +1990,7 @@ class SyncEngine private constructor() {
                         "(${size}B > limit ${config.autoDownloadMaxSize}B), keeping clipboard text only")
                 } else {
                 val name = profile.dataName!!
-                val destPath = java.io.File(EngineStorage.downloadsDir(context), name).absolutePath
+                val destPath = EngineStorage.resolveDownloadFile(EngineStorage.downloadsDir(context, serverKey), name).path
                 Logger.info(TAG, "downloadAndApplyContent: downloading file $name")
                 client.downloadFile(name, destPath)
                 val destFile = java.io.File(destPath)
@@ -1945,12 +1998,13 @@ class SyncEngine private constructor() {
                 downloadedFilePath = destPath
                 Logger.info(TAG, "File downloaded: $name -> $destPath (size=${destFile.length()})")
                 // downloads/ 仅保留"当前文件"：历史归档由 HistoryService 复制到 history_files/（受磁盘 LRU 管理）
-                trimDownloadsDir(context, name)
+                trimDownloadsDir(context, name, serverKey)
                 }
             } else {
                 Logger.debug(TAG, "downloadAndApplyContent: no file data, skipping download")
             }
 
+            check(client === apiClient && serverKey == config.serverStorageKey()) { "Server changed during download" }
             // 写入剪贴板前设置 lastLocalHash，防止 listener 二次上传
             // 同时设置 lastRemoteHash，防止下次轮询把刚写入剪贴板的内容误判为新内容
             val localHash = HashUtils.sha256(profile.text)
@@ -1974,7 +2028,7 @@ class SyncEngine private constructor() {
                     Logger.debug(TAG, "downloadAndApplyContent: auto-saving file")
                     autoSaveToFile(context, downloadedFilePath!!, profile.type, profile.dataName)
                 } catch (e: Exception) {
-                    Logger.warn(TAG, "Auto save failed: ${e.message}")
+                    Logger.warn(TAG, "Auto save failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                 }
             }
 
@@ -1990,7 +2044,7 @@ class SyncEngine private constructor() {
                 profileHash = profile.hash,
                 timestamp = System.currentTimeMillis()
             )
-            getHistoryService()?.addRemoteContent(historyContent, downloadedFilePath)
+            getHistoryService(serverKey)?.addRemoteContent(historyContent, downloadedFilePath)
             Logger.debug(TAG, "downloadAndApplyContent: history recorded")
             lastRemoteFilePath = downloadedFilePath
             appContext?.let { Prefs.saveLastRemoteFilePath(it, downloadedFilePath) }
@@ -2003,7 +2057,7 @@ class SyncEngine private constructor() {
             lastSyncTime = System.currentTimeMillis()
             Logger.info(TAG, "Remote content applied to local clipboard")
         } catch (e: Exception) {
-            Logger.error(TAG, "Download and apply failed", e)
+            Logger.error(TAG, "Download and apply failed")
         }
     }
 
@@ -2077,7 +2131,7 @@ class SyncEngine private constructor() {
 
             Logger.debug(TAG, "Written to clipboard: textLength=${text.length}")
         } catch (e: Exception) {
-            Logger.error(TAG, "Failed to write to clipboard", e)
+            Logger.error(TAG, "Failed to write to clipboard")
         }
     }
 
@@ -2097,7 +2151,7 @@ class SyncEngine private constructor() {
 
             Logger.info(TAG, "Written URI to clipboard: $uri, mime=$mime, label=$label")
         } catch (e: Exception) {
-            Logger.error(TAG, "Failed to write URI to clipboard, falling back to text", e)
+            Logger.error(TAG, "Failed to write URI to clipboard, falling back to text")
             writeToClipboard(label)
         }
     }
@@ -2108,9 +2162,9 @@ class SyncEngine private constructor() {
         try {
             val intent = Intent(BridgeKeys.EVENT_CLIPBOARD_CHANGED)
                 .setPackage("io.github.erenche.syncclipboard")
-            context.sendBroadcast(intent)
+            BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to notify content changed: ${e.message}")
+            Logger.warn(TAG, "Failed to notify content changed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -2128,9 +2182,9 @@ class SyncEngine private constructor() {
         try {
             val intent = Intent(BridgeKeys.EVENT_SYNC_STATE_CHANGED)
                 .setPackage("io.github.erenche.syncclipboard")
-            context.sendBroadcast(intent)
+            BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to notify sync state changed: ${e.message}")
+            Logger.warn(TAG, "Failed to notify sync state changed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -2146,9 +2200,9 @@ class SyncEngine private constructor() {
                 .putExtra("action", action)
                 .putExtra("success", success)
                 .putExtra("message", message ?: "")
-            context.sendBroadcast(intent)
+            BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to notify action result: ${e.message}")
+            Logger.warn(TAG, "Failed to notify action result: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -2162,30 +2216,33 @@ class SyncEngine private constructor() {
                 .putExtra("fetched", fetched)
                 .putExtra("count", count)
             if (error != null) intent.putExtra("error", error)
-            context.sendBroadcast(intent)
+            BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to notify history sync completed: ${e.message}")
+            Logger.warn(TAG, "Failed to notify history sync completed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
     private fun rebuildApiClient() {
         val server = config.servers.getOrNull(config.activeServerIndex)
-        apiClient = if (server != null) {
+        val previous = clientSession
+        clientSession = if (server != null) {
             try {
-                ClientFactory.createClient(server)
+                ClientSession(config.serverStorageKey(), ClientFactory.createClient(server))
             } catch (e: Exception) {
-                Logger.warn(TAG, "Failed to create API client: ${e.message}")
+                Logger.warn(TAG, "Failed to create API client: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                 null
             }
         } else {
             null
         }
+        previous?.client?.close()
         // SignalR 仅在官方服务器模式且配置开启时创建
         rebuildSignalRClient(server)
     }
 
     /** 根据服务器类型和配置创建/销毁 SignalR 客户端 */
     private fun rebuildSignalRClient(server: ServerConfig?) {
+        val serverKey = config.serverStorageKey()
         // 先停止并释放旧连接
         signalRClient?.let { old ->
             old.dispose()
@@ -2220,7 +2277,8 @@ class SyncEngine private constructor() {
                 username = server.username,
                 password = server.password
             )
-            client.onProfileChanged = { profile ->
+            client.onProfileChanged = profileChanged@ { profile ->
+                if (serverKey != config.serverStorageKey()) return@profileChanged
                 // 推送回调：触发强制拉取（复用 fetchRemoteClipboard 的去重和下载逻辑）
                 scope.launch {
                     // 防御：配置变更竞态期间收到推送时，总开关已关则丢弃
@@ -2229,15 +2287,16 @@ class SyncEngine private constructor() {
                     try {
                         fetchRemoteClipboard(force = true)
                     } catch (e: Exception) {
-                        Logger.warn(TAG, "SignalR push fetch failed", e)
+                        Logger.warn(TAG, "SignalR push fetch failed")
                     }
                 }
             }
             client.onHistoryChanged = { dto ->
                 // 推送事件送入通道串行化处理，避免批量推送时协程堆积
-                historyPushChannel.trySend(dto)
+                historyPushChannel.trySend(HistoryPush(serverKey, dto))
             }
-            client.onConnectionStateChanged = { connected ->
+            client.onConnectionStateChanged = connectionChanged@ { connected ->
+                if (serverKey != config.serverStorageKey()) return@connectionChanged
                 isSignalRConnected = connected
                 Logger.info(TAG, "SignalR connection: ${if (connected) "connected" else "disconnected"}")
                 if (connected) {
@@ -2249,7 +2308,7 @@ class SyncEngine private constructor() {
                             Logger.info(TAG, "SignalR reconnected, triggering catch-up fetch")
                             fetchRemoteClipboard(force = true)
                         } catch (e: Exception) {
-                            Logger.warn(TAG, "Catch-up fetch on SignalR reconnect failed: ${e.message}")
+                            Logger.warn(TAG, "Catch-up fetch on SignalR reconnect failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                         }
                     }
                     // 断连期间可能漏掉历史推送：重连后立即补一次历史增量同步
@@ -2261,7 +2320,7 @@ class SyncEngine private constructor() {
                                 lastHistorySyncAt = android.os.SystemClock.elapsedRealtime()
                             }
                         } catch (e: Exception) {
-                            Logger.warn(TAG, "Catch-up history sync on reconnect failed: ${e.message}")
+                            Logger.warn(TAG, "Catch-up history sync on reconnect failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                         }
                     }
                     // 网络可达：顺带重放上传失败队列
@@ -2274,7 +2333,7 @@ class SyncEngine private constructor() {
             startHistoryPushConsumer()
             Logger.info(TAG, "SignalR client created for server: ${server.url}")
         } catch (e: Exception) {
-            Logger.warn(TAG, "Failed to create SignalR client: ${e.message}")
+            Logger.warn(TAG, "Failed to create SignalR client: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
         }
     }
 
@@ -2282,11 +2341,12 @@ class SyncEngine private constructor() {
     private fun startHistoryPushConsumer() {
         historyPushConsumer?.cancel()
         historyPushConsumer = scope.launch {
-            for (dto in historyPushChannel) {
+            for (push in historyPushChannel) {
+                if (push.serverKey != config.serverStorageKey()) continue
                 try {
-                    handleRemoteHistoryChanged(dto)
+                    handleRemoteHistoryChanged(push.record, push.serverKey)
                 } catch (e: Exception) {
-                    Logger.warn(TAG, "History push consumer error: ${e.message}")
+                    Logger.warn(TAG, "History push consumer error: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                 }
             }
         }
@@ -2294,18 +2354,19 @@ class SyncEngine private constructor() {
 
     /** 处理 SignalR 推送的历史记录变化（增量合并单条 DTO）。
      *  与 syncHistory 互斥，避免全量合并覆盖推送写入的新版本。 */
-    private suspend fun handleRemoteHistoryChanged(dto: HistoryRecordDto) {
-        val hs = getHistoryService() ?: return
+    private suspend fun handleRemoteHistoryChanged(dto: HistoryRecordDto, serverKey: String) {
+        val hs = getHistoryService(serverKey) ?: return
         // 历史推送同步同样受自动同步总开关约束（与轮询路径的历史同步保持一致）
         if (!config.enableAutoSync || !config.enableHistorySync) return
         historySyncMutex.withLock {
+            if (serverKey != config.serverStorageKey()) return@withLock
             try {
                 Logger.info(TAG, "SignalR push: RemoteHistoryChanged, hash=${dto.hash}, merging")
                 hs.mergeFromServerDtos(listOf(dto))
                 // 通知 app 端历史记录已变化，触发 UI 刷新
                 notifyContentChanged()
             } catch (e: Exception) {
-                Logger.warn(TAG, "Failed to merge remote history push: ${e.message}")
+                Logger.warn(TAG, "Failed to merge remote history push: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
             }
         }
     }
@@ -2313,16 +2374,18 @@ class SyncEngine private constructor() {
     /** 单条历史记录变更后即时 PATCH 推送到服务器。
      *  获取 historySyncMutex 避免与 syncHistory 并发，复用 processPatchItem 逻辑。
      *  仅 SyncClipboard 官方服务器模式生效；WebDAV/S3 不支持历史 PATCH，仅做本地变更。 */
-    private suspend fun pushSingleHistoryUpdate(id: String): PatchOutcome? {
-        val hs = getHistoryService() ?: return null
+    private suspend fun pushSingleHistoryUpdate(id: String, serverKey: String = config.serverStorageKey()): PatchOutcome? {
+        if (serverKey != config.serverStorageKey()) return PatchOutcome.FAILED
+        val hs = getHistoryService(serverKey) ?: return null
         val initial = hs.getByIdIncludingDeleted(id) ?: return null
         // 星标/置顶仍受历史同步开关控制；删除是用户的显式操作，始终尝试同步到服务器。
         if (!initial.isDeleted && !config.enableHistorySync) return null
         val server = config.servers.getOrNull(config.activeServerIndex)
         if (server == null || server.type != ServerType.syncclipboard) return null
-        val client = apiClient ?: return PatchOutcome.FAILED
+        val client = sessionFor(serverKey)?.client ?: return PatchOutcome.FAILED
         if (initial.syncStatus != HistorySyncStatus.NeedSync) return null
         return historySyncMutex.withLock {
+            if (client !== apiClient || serverKey != config.serverStorageKey()) return@withLock PatchOutcome.FAILED
             // 重新读取，避免在等待锁期间状态被其他流程改变
             val current = hs.getByIdIncludingDeleted(id) ?: return@withLock null
             if (current.syncStatus != HistorySyncStatus.NeedSync) return@withLock null
@@ -2331,7 +2394,7 @@ class SyncEngine private constructor() {
                 Logger.info(TAG, "pushSingleHistoryUpdate: hash=${current.profileHash}, outcome=$outcome")
                 outcome
             } catch (e: Exception) {
-                Logger.warn(TAG, "pushSingleHistoryUpdate failed: ${e.message}")
+                Logger.warn(TAG, "pushSingleHistoryUpdate failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                 PatchOutcome.FAILED
             }
         }
@@ -2340,18 +2403,19 @@ class SyncEngine private constructor() {
     /** 重试所有本地删除墓碑。删除同步独立于历史同步开关，避免关闭历史同步时服务器残留。 */
     private fun flushPendingHistoryDeletes() {
         if (historyDeleteFlushJob?.isActive == true) return
+        val serverKey = config.serverStorageKey()
         historyDeleteFlushJob = scope.launch {
             try {
                 var retryDelayMs = 30_000L
-                while (isActive) {
-                    val pending = getHistoryService()?.getNeedSyncItems()
+                while (isActive && serverKey == config.serverStorageKey()) {
+                    val pending = getHistoryService(serverKey)?.getNeedSyncItems()
                         ?.filter { it.isDeleted }
                         .orEmpty()
                     if (pending.isEmpty()) break
 
                     var transientFailure = false
                     for (item in pending) {
-                        if (pushSingleHistoryUpdate(item.id) == PatchOutcome.FAILED) {
+                        if (pushSingleHistoryUpdate(item.id, serverKey) == PatchOutcome.FAILED) {
                             transientFailure = true
                         }
                     }
@@ -2362,7 +2426,36 @@ class SyncEngine private constructor() {
                     retryDelayMs = (retryDelayMs * 2).coerceAtMost(5 * 60_000L)
                 }
             } catch (e: Exception) {
-                Logger.warn(TAG, "Pending history delete flush failed: ${e.message}")
+                Logger.warn(TAG, "Pending history delete flush failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
+            }
+        }
+    }
+
+    @Synchronized
+    private fun applyAppConfig(context: Context, data: Bundle): Bundle {
+        val revision = data.getLong("revision", 0)
+        val prefs = Prefs.getPrefs(context)
+        val applied = prefs.getLong("applied_app_revision", 0)
+        return try {
+            check(io.github.erenche.syncclipboard.bridge.ConfigRevisionPolicy.accepts(revision, applied))
+            val raw = requireNotNull(data.getString("config"))
+            val next = Json.decodeFromString(AppConfig.serializer(), raw)
+            check(revision != applied || next == config) { "Config revision conflict" }
+            if (next != config || revision != applied) {
+                Prefs.saveConfig(context, next)
+                onConfigChanged(next)
+                check(prefs.edit().putLong("applied_app_revision", revision).commit())
+            }
+            Bundle().apply {
+                putBoolean("applied", true)
+                putLong("revision", revision)
+            }
+        } catch (e: Exception) {
+            Logger.warn(TAG, "Config not applied: ${e.javaClass.simpleName}")
+            Bundle().apply {
+                putBoolean("applied", false)
+                putLong("revision", applied)
+                if (Prefs.configStorageError) putString("error", "storage_unavailable")
             }
         }
     }
@@ -2375,14 +2468,20 @@ class SyncEngine private constructor() {
             }
 
             onCommand(BridgeKeys.PUSH_CONFIG) { data ->
+                // 已启用版本协议后，忽略旧版单向更新，避免重排覆盖。
+                if (Prefs.getPrefs(context).getLong("applied_app_revision", 0) > 0) return@onCommand
                 val configJson = data.getString("config") ?: return@onCommand
                 try {
                     val newConfig = Json.decodeFromString(AppConfig.serializer(), configJson)
-                    onConfigChanged(newConfig)
                     Prefs.saveConfig(context, newConfig)
+                    onConfigChanged(newConfig)
                 } catch (e: Exception) {
-                    Logger.error(TAG, "Failed to parse config", e)
+                    Logger.warn(TAG, "Config update failed: ${e.javaClass.simpleName}")
                 }
+            }
+
+            onQuery(BridgeKeys.APPLY_CONFIG) {
+                reply(applyAppConfig(context, data))
             }
 
             onQuery(BridgeKeys.GET_SYNC_STATUS) {
@@ -2405,7 +2504,7 @@ class SyncEngine private constructor() {
                         try {
                             fetchRemoteClipboard(force = true)
                         } catch (e: Exception) {
-                            Logger.warn(TAG, "GET_CURRENT_CLIPBOARD: async fetch failed", e)
+                            Logger.warn(TAG, "GET_CURRENT_CLIPBOARD: async fetch failed")
                         }
                     }
                 }
@@ -2438,7 +2537,8 @@ class SyncEngine private constructor() {
                 val fileName = data.getString("fileName") ?: return@onCommand
                 val isImage = data.getBoolean("isImage", false)
                 val fileSize = data.getLong("fileSize", 0L)
-                registerUploadedContent(fileUri, fileName, isImage, fileSize)
+                val serverKey = data.getString("serverKey") ?: config.serverStorageKey()
+                registerUploadedContent(fileUri, fileName, isImage, fileSize, serverKey)
             }
 
             onCommand(BridgeKeys.CLEAR_ENGINE_DATA) {
@@ -2449,18 +2549,8 @@ class SyncEngine private constructor() {
                 val ctx = appContext
                 val bytes = if (ctx == null) 0L else try {
                     var total = 0L
-                    // 历史数据库文件（含 WAL/SHM）
-                    listOf("clipboard_history.db", "clipboard_history.db-wal", "clipboard_history.db-shm")
-                        .forEach { name ->
-                            val f = java.io.File(EngineStorage.rootDir(ctx), name)
-                            if (f.isFile) total += f.length()
-                        }
-                    // 历史文件目录与下载目录
-                    listOf(EngineStorage.historyDir(ctx), EngineStorage.downloadsDir(ctx)).forEach { dir ->
-                        if (dir.isDirectory) {
-                            dir.walkTopDown().filter { it.isFile }.forEach { total += it.length() }
-                        }
-                    }
+                    // 包含所有服务器的历史库、归档和下载目录。
+                    EngineStorage.rootDir(ctx).walkTopDown().filter { it.isFile }.forEach { total += it.length() }
                     // 上传临时文件
                     EngineStorage.uploadTempDir(ctx).listFiles()
                         ?.filter { it.isFile }
@@ -2482,7 +2572,7 @@ class SyncEngine private constructor() {
                 try {
                     val ctx = appContext
                     if (ctx != null) {
-                        val dir = EngineStorage.downloadsDir(ctx)
+                        val dir = EngineStorage.downloadsDir(ctx, config.serverStorageKey())
                         val file = java.io.File(dir, fileName)
                         // canonical 路径校验：拒绝 ../ 穿越出下载目录
                         if (file.canonicalPath.startsWith(dir.canonicalPath + java.io.File.separator)
@@ -2502,7 +2592,7 @@ class SyncEngine private constructor() {
                 } catch (e: Exception) {
                     // open 成功但 reply 前异常：立即关闭，避免 SystemUI 侧泄露
                     runCatching { pfd?.close() }
-                    Logger.warn(TAG, "GET_DOWNLOADED_FILE failed: ${e.message}")
+                    Logger.warn(TAG, "GET_DOWNLOADED_FILE failed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
                     reply(Bundle.EMPTY)
                 }
             }
@@ -2610,14 +2700,15 @@ class SyncEngine private constructor() {
                 try {
                     val serverConfig = Json { ignoreUnknownKeys = true }
                         .decodeFromString(ServerConfig.serializer(), serverJson)
-                    val client = ClientFactory.createClient(serverConfig)
-                    client.testConnection()
+                    withTimeout(10_000L) {
+                        ClientFactory.createClient(serverConfig).use { it.testConnection() }
+                    }
                     reply(Bundle().apply { putBoolean("success", true) })
                 } catch (e: Exception) {
-                    Logger.error(TAG, "Test connection failed", e)
+                    Logger.error(TAG, "Test connection failed")
                     reply(Bundle().apply {
                         putBoolean("success", false)
-                        putString("error", e.message ?: "Connection failed")
+                        putString("error", io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e))
                     })
                 }
             }
