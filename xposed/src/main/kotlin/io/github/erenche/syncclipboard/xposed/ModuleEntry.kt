@@ -34,7 +34,7 @@ class ModuleEntry : XposedModule() {
         private val scopes = listOf(
             PackageNames.SYSTEM_UI,
             PackageNames.APPLICATION,
-            PackageNames.PHRASE_EXPERIMENT
+            PackageNames.PHRASE
         )
         lateinit var instance: ModuleEntry
     }
@@ -67,7 +67,7 @@ class ModuleEntry : XposedModule() {
         if (pkg !in scopes) return
         Logger.info(TAG, "onPackageLoaded: $pkg")
 
-        if (pkg == PackageNames.PHRASE_EXPERIMENT) {
+        if (pkg == PackageNames.PHRASE) {
             PhraseExperimentHook.install(this, param.defaultClassLoader)
             return
         }

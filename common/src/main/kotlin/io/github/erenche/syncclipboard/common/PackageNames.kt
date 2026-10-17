@@ -12,8 +12,8 @@ object PackageNames {
     /** SystemUI 的包名 */
     const val SYSTEM_UI = "com.android.systemui"
 
-    /** 实验包：由「剪贴板与常用语 5.7.0」修改包名后安装 */
-    const val PHRASE_EXPERIMENT = "com.miui.phrase.experiment"
+    /** 剪贴板与常用语 5.7.0 */
+    const val PHRASE = "com.miui.phrase"
 
     /** Android 系统（system_server） */
     const val ANDROID = "android"
