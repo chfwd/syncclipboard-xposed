@@ -34,7 +34,8 @@ class ModuleEntry : XposedModule() {
         private val scopes = listOf(
             PackageNames.SYSTEM_UI,
             PackageNames.APPLICATION,
-            PackageNames.PHRASE
+            PackageNames.PHRASE,
+            PackageNames.IFLYTEK_IME
         )
         lateinit var instance: ModuleEntry
     }
@@ -69,6 +70,11 @@ class ModuleEntry : XposedModule() {
 
         if (pkg == PackageNames.PHRASE) {
             PhraseExperimentHook.install(this, param.defaultClassLoader)
+            return
+        }
+
+        if (pkg == PackageNames.IFLYTEK_IME) {
+            PhraseExperimentHook.installForInputMethod(this, param.defaultClassLoader)
             return
         }
 

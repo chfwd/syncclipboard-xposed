@@ -15,6 +15,9 @@ object PackageNames {
     /** 剪贴板与常用语 5.7.0 */
     const val PHRASE = "com.miui.phrase"
 
+    /** 当前默认输入法：讯飞输入法 */
+    const val IFLYTEK_IME = "com.iflytek.inputmethod"
+
     /** Android 系统（system_server） */
     const val ANDROID = "android"
 }
