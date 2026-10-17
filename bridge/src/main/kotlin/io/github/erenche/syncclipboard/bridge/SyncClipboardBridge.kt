@@ -38,7 +38,7 @@ import java.util.concurrent.ConcurrentHashMap
 object SyncClipboardBridge {
 
     private const val TAG = "Bridge"
-    private const val ACTION_IPC = "io.github.erenche.syncclipboard.ACTION_IPC_ROUTER"
+    private const val ACTION_IPC = "io.github.erenche.syncclipboard.experiment.ACTION_IPC_ROUTER"
     private const val EXTRA_KEY = "key"
     private const val EXTRA_PAYLOAD = "payload"
     private const val EXTRA_CALLBACK = "callback"
@@ -48,7 +48,7 @@ object SyncClipboardBridge {
      * App 自身声明该权限并 uses-permission（签名一致自动授予），SystemUI 进程
      * 注册 receiver 时通过该 permission 过滤发送方。第三方 App 签名不同无法获得。
      */
-    const val PERMISSION_BRIDGE = "io.github.erenche.syncclipboard.permission.BRIDGE"
+    const val PERMISSION_BRIDGE = "io.github.erenche.syncclipboard.experiment.permission.BRIDGE"
 
     /** 处理器存储：支持挂起函数的 Lambda 容器 */
     private val handlers = ConcurrentHashMap<String, suspend (Bundle) -> Bundle?>()

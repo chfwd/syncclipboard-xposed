@@ -9,7 +9,7 @@ plugins {
     alias(libs.plugins.ksp) apply false
 }
 
-extra["appPackageName"] = "io.github.erenche.syncclipboard"
+extra["appPackageName"] = "io.github.erenche.syncclipboard.experiment"
 extra["appVersionCode"] = 57
 extra["appVersionName"] = "1.2.2"
 extra["compileSdkVersion"] = 37

@@ -11,7 +11,7 @@ import io.github.erenche.syncclipboard.common.util.Logger
 
 /** 向 system_server 同步局域网开关，接收端通过模块签名权限校验来源。 */
 object LocalNetworkAccessBridge {
-    const val ACTION = "io.github.erenche.syncclipboard.SET_SYSTEMUI_LOCAL_NETWORK_ACCESS"
+    const val ACTION = "io.github.erenche.syncclipboard.experiment.SET_SYSTEMUI_LOCAL_NETWORK_ACCESS"
     const val EXTRA_ENABLED = "enabled"
     const val EXTRA_CALLBACK = "callback"
 

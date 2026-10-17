@@ -2161,7 +2161,7 @@ class SyncEngine private constructor() {
         val context = appContext ?: return
         try {
             val intent = Intent(BridgeKeys.EVENT_CLIPBOARD_CHANGED)
-                .setPackage("io.github.erenche.syncclipboard")
+                .setPackage(PackageNames.APPLICATION)
             BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
             Logger.warn(TAG, "Failed to notify content changed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
@@ -2181,7 +2181,7 @@ class SyncEngine private constructor() {
         val context = appContext ?: return
         try {
             val intent = Intent(BridgeKeys.EVENT_SYNC_STATE_CHANGED)
-                .setPackage("io.github.erenche.syncclipboard")
+                .setPackage(PackageNames.APPLICATION)
             BridgeSecurity.sendBroadcast(context, intent)
         } catch (e: Exception) {
             Logger.warn(TAG, "Failed to notify sync state changed: ${io.github.erenche.syncclipboard.common.util.SafeDiagnostics.failure(e)}")
@@ -2196,7 +2196,7 @@ class SyncEngine private constructor() {
         val context = appContext ?: return
         try {
             val intent = Intent(BridgeKeys.EVENT_ACTION_RESULT)
-                .setPackage("io.github.erenche.syncclipboard")
+                .setPackage(PackageNames.APPLICATION)
                 .putExtra("action", action)
                 .putExtra("success", success)
                 .putExtra("message", message ?: "")
@@ -2211,7 +2211,7 @@ class SyncEngine private constructor() {
         val context = appContext ?: return
         try {
             val intent = Intent(BridgeKeys.EVENT_HISTORY_SYNC_COMPLETED)
-                .setPackage("io.github.erenche.syncclipboard")
+                .setPackage(PackageNames.APPLICATION)
                 .putExtra("success", success)
                 .putExtra("fetched", fetched)
                 .putExtra("count", count)

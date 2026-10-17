@@ -12,7 +12,7 @@
          仅与本 App 同签名的进程可发送广播。App 与自身签名一致，自动获得授权；
          第三方 App 签名不同，无法获得该权限，因此无法伪造 IPC 广播。 -->
     <permission
-        android:name="io.github.erenche.syncclipboard.permission.BRIDGE"
+        android:name="io.github.erenche.syncclipboard.experiment.permission.BRIDGE"
         android:protectionLevel="signature" />
 
     <uses-permission android:name="android.permission.INTERNET" />
@@ -21,7 +21,7 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
-    <uses-permission android:name="io.github.erenche.syncclipboard.permission.BRIDGE" />
+    <uses-permission android:name="io.github.erenche.syncclipboard.experiment.permission.BRIDGE" />
 
     <application
         android:name=".SyncClipboardApp"
