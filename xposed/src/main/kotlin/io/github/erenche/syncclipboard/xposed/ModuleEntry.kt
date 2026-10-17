@@ -4,6 +4,7 @@ import androidx.annotation.Keep
 import io.github.erenche.syncclipboard.common.PackageNames
 import io.github.erenche.syncclipboard.common.util.Logger
 import io.github.erenche.syncclipboard.xposed.hook.GeneralHooker
+import io.github.erenche.syncclipboard.xposed.hook.PhraseExperimentHook
 import io.github.erenche.syncclipboard.xposed.hook.SystemNotificationHooker
 import io.github.erenche.syncclipboard.xposed.hook.SystemLocalNetworkHooker
 import io.github.erenche.syncclipboard.xposed.sync.SyncEngine
@@ -32,7 +33,8 @@ class ModuleEntry : XposedModule() {
         private const val TAG = "ModuleEntry"
         private val scopes = listOf(
             PackageNames.SYSTEM_UI,
-            PackageNames.APPLICATION
+            PackageNames.APPLICATION,
+            PackageNames.PHRASE_EXPERIMENT
         )
         lateinit var instance: ModuleEntry
     }
@@ -64,6 +66,11 @@ class ModuleEntry : XposedModule() {
         val pkg = param.packageName
         if (pkg !in scopes) return
         Logger.info(TAG, "onPackageLoaded: $pkg")
+
+        if (pkg == PackageNames.PHRASE_EXPERIMENT) {
+            PhraseExperimentHook.install(this, param.defaultClassLoader)
+            return
+        }
 
         GeneralHooker.hook(this, param)
     }
